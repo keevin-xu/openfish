@@ -103,6 +103,9 @@ void openfish_decode_gpu(
     
     dim3 block_size(block_width, block_width, 1);
     dim3 block_size_beam(MAX_BEAM_WIDTH * NUM_BASES, 1, 1);
+    // compute_qual_data parallelises over timesteps within a chunk (see beam_search_cuda.h);
+    // generate_sequence is still single-threaded per chunk.
+    dim3 block_size_qual(256, 1, 1);
     dim3 block_size_gen(1, 1, 1);
 	dim3 grid_size(batch_size, 1, 1);
 
@@ -181,7 +184,7 @@ void openfish_decode_gpu(
     checkCudaError();
 
     OPENFISH_LOG_TRACE("%s", "compute qual data...");
-    compute_qual_data<<<grid_size,block_size_gen>>>(
+    compute_qual_data<<<grid_size,block_size_qual>>>(
         beam_args,
         (state_t *)gpubuf->states,
         gpubuf->qual_data,

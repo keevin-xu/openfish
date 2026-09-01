@@ -661,7 +661,10 @@ static __global__ void compute_qual_data(
     int shifted_states[2 * NUM_BASES];
 
     // compute per-base qual data
-    for (size_t block_idx = 0; block_idx < n_timesteps; ++block_idx) {
+    // each iteration of this loop is independent: it reads post_NTC (read-only), reads and writes
+    // states[] only at its own index, and writes its own NUM_BASES slots of qual_data. so the loop
+    // is a pure map over timesteps and is strided across the block rather than run by one thread.
+    for (size_t block_idx = threadIdx.x; block_idx < n_timesteps; block_idx += blockDim.x) {
         int state = states[block_idx];
         states[block_idx] = states[block_idx] % NUM_BASES;
         int base_to_emit = states[block_idx];
