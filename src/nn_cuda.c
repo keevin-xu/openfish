@@ -78,7 +78,11 @@ void openfish_silu_mul_gpu(
     int n_tokens,
     int hidden_dim
 ) {
-    int threads = 1024;
+    // silu_mul walks the row as half2, so it needs hidden_dim/2 work items per token
+    ASSERT(hidden_dim % 2 == 0);
+    int threads = hidden_dim / 2;
+    if (threads > 1024) threads = 1024;
+    if (threads < 32) threads = 32;
     int blocks = n_tokens;
 
     silu_mul<<<blocks, threads>>>(

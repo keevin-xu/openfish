@@ -74,18 +74,27 @@ static __global__ void silu_mul(
     const uint64_t hidden_dim,
     const uint64_t n_tokens
 ) {
-    uint64_t j = blockIdx.x;
+    const uint64_t j = blockIdx.x;
 
-    for (uint64_t k = threadIdx.x; k < hidden_dim; k += blockDim.x) {
-        uint64_t i = k + j * (hidden_dim * 2);
+    // vectorised half2 access. a token's row is [value | gate], each half contiguous and
+    // hidden_dim apart, and the caller asserts hidden_dim is even, so the value base, the gate
+    // base and the output row are all 4-byte aligned and can be walked two elements at a time.
+    // arithmetic per element is unchanged, so results are bit-identical to the scalar version.
+    const uint64_t half_dim = hidden_dim / 2;
 
-        half y = in[i];
-        half gate = in[i + hidden_dim];
+    const half2 *const in_y    = (const half2 *)(in  + j * (hidden_dim * 2));
+    const half2 *const in_gate = (const half2 *)(in  + j * (hidden_dim * 2) + hidden_dim);
+    half2 *const out_row       = (half2 *)(out + j * hidden_dim);
 
-        float g = __half2float(gate);
-        float silu = g / (1.0f + __expf(-g));
+    for (uint64_t k = threadIdx.x; k < half_dim; k += blockDim.x) {
+        const float2 y = __half22float2(in_y[k]);
+        const float2 g = __half22float2(in_gate[k]);
 
-        out[k + j * hidden_dim] = __float2half(silu * __half2float(y));
+        float2 r;
+        r.x = (g.x / (1.0f + __expf(-g.x))) * y.x;
+        r.y = (g.y / (1.0f + __expf(-g.y))) * y.y;
+
+        out_row[k] = __float22half2_rn(r);
     }
 }
 
