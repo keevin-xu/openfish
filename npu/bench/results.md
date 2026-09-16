@@ -55,3 +55,26 @@ attn_in 38, wqkv weight 56. **Hypothesis (unverified):** aie2p's GEMM emulates b
 sharing one exponent (`AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16`), so small values in a block with an outlier lose
 precision; randn inputs don't exercise this. The error beyond the bf16-input floor (≈2e-3) is ≈1–6e-3 mean.
 Not a Phase-1 PASS for any linear; per-op cosine ≥ 0.99997 — the identity gate would have to decide.
+
+## 2026-09-16 — root cause: BFP16 emulation in the aie2p GEMM microkernel (confirmed)
+
+`aie_api/detail/aie2p/mmul_bf16_bf16.hpp`: with `AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16` (set by the registry
+Makefile) the 8×8×8 mmul converts both operands to `v64bfp16ebs8` = **blocks of 8 elements sharing one 8-bit
+exponent with 8-bit integer mantissas** (`aie_doc.hpp` block-vector table), documented as "to increase throughput
+at the cost of accuracy". bf16 proper has a per-element exponent. Heavy-tailed real tensors (max/median 20–479)
+put small values in blocks with outliers → few effective bits.
+
+Experiment: same `mm_aie2p.cc`, same tiles/method, compiled with vs without that define (`test_gemm_npu.py
+--mmul {bfp16,native}`), real SUP L0 data, M=4096. "fp32 intermediate" = the fused-cast f32 scratch, i.e. the
+`bf16_in_fp32_out` datapath. Raw: server `~/p0/gemm_real_bfp16.txt`, `~/p0/gemm_real_native.txt`.
+
+| op | mmul | registry gate | out vs fp32(A_bf16@B_bf16) mean_rel_L1 | fp32 intermediate vs same | vs CPU dump (bf16 out) | vs CPU dump (fp32 out) | cosine (bf16 out) | NPU ms | CPU 8thr ms | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fc1 | bfp16 | FAIL 10.05% | 7.819e-3 | 7.248e-3 | 8.094e-3 | 7.390e-3 | 0.99997199 | 4.60 | 23.97 | 5.2× |
+| fc1 | native | **PASS** | 2.819e-3 | **1.240e-7** (0 outside tol) | 3.276e-3 | **1.415e-3** | 0.99999375 | 20.25 | 23.36 | 1.2× |
+| fc2 | bfp16 | FAIL 8.06% | 8.077e-3 | 7.546e-3 | 8.396e-3 | 7.740e-3 | 0.99996687 | 1.62 | 9.86 | 6.1× |
+| fc2 | native | **PASS** | 2.820e-3 | **4.321e-7** (0 outside tol) | 3.432e-3 | **1.690e-3** | 0.99999329 | 9.50 | 9.84 | 1.0× |
+
+Conclusion: the example is correct for what it was verified on, and the NPU arithmetic is exact (native fp32
+intermediate matches to 1e-7); the accuracy loss is the BFP16 emulation, and so is the 4–6× speedup. Native bf16
+with fp32 output is accurate to the bf16-input floor (~1.4–1.7e-3) but only ~CPU speed (8 threads) kernel-only.
