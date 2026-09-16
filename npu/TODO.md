@@ -3,8 +3,8 @@
 ## Phase status — silu_mul (Tier 1 #1, template kernel)
 - [x] 0: CPU Oracle (`bc-phase-0-cpu-oracle`) — PASS 2026-09-16 (identity fast/hac/sup, dumps, reference.py; see docs/development_progress/progress.md)
 - [x] 1: Kernel Validation (`bc-phase-1-kernel-validation`) — PASS 2026-09-16 (1/1 shapes: N=16,777,216 randn + real SUP activations; 8x1 tiles; `docs/development_progress/phase1_kernels.md`)
-- [ ] 2: Single-Block / integration (`openfish-npu-backend`, per-layer cosine >= 0.99)
-- [ ] 3: Full basecaller (identity-score gate)
+- [x] 2: Single-Block / integration (`openfish-npu-backend`) — PASS 2026-09-16 (18 layers, 306 activations cosine ≥ 0.99, min 0.99897)
+- [x] 3: Full basecaller — PASS 2026-09-16 (median 0.9881625 vs CPU 0.988506, Δ −0.000344; gate ±0.001)
 - [ ] 4/5: Optimization (Tier 2/3)
 - [ ] 6: Finalize
 - [ ] 7: Independent Evaluation (`phase-7-independent-evaluator`)

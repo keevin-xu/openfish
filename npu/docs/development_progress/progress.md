@@ -49,3 +49,38 @@ Dump: `~/p0/dump_sup8` (SUP L0, 8 rows; reference checks PASS on it too).
   vs 4.3 ms kernel. Per-call BO allocation in the Python invoker dominates — the C backend must pre-allocate.
 
 **Phase 1 (silu_mul): PASS.** Details: `phase1_kernels.md`.
+
+## 2026-09-16 — Phase 2: silu_mul integrated into openfish/slorado — PASS
+
+Backend: `src/nn_npu.{h,cpp}` (XRT full-ELF; device/context/kernel/BOs/run created once; process-lifetime
+`flock($NPU_LOCK)`; bf16 conversion in C++, bit-exact vs ml_dtypes on 10M values; 16 launches of the verified
+N=16,777,216 ELF per SUP call, zero-padded tail). Build `make npu=1` (slorado + openfish); call site
+`TxModel.cpp` GatedMLP `#elif defined HAVE_NPU`. ELF harness re-validated first (identical PASS, 4110 µs).
+Artifact `silu_mul_n16777216_t4096_h8x1.elf` sha256 7a2cbf77…b978. Commits: slorado `0565e1d`, openfish `ccbc046`.
+
+- Smoke (reads_1.blow5): sequence identical to CPU. 18 calls / 288 launches; host in 5.2 s, kernel 1.3 s
+  (4.6 ms/launch), host out 1.3 s.
+- Gate (pre-registered): 18-layer, 1-row dumps of the first reads_1k batch (`-C 128`), CPU vs NPU binary:
+  306/306 activations finite with whole-tensor cosine ≥ 0.99 (min 0.99897, L11 silu_mul out); 198 parameters
+  bit-identical; everything upstream of L0 silu_mul bit-identical. enc_out cosine 0.99998 (L0) → 0.99964 (L17).
+- Watch: per-position min cosine degrades with depth (enc_out 0.862 at L11; silu_mul out 0.765 at L14). Not a
+  pre-registered gate; the Phase-3 identity score decides.
+
+**Phase 2 (silu_mul): PASS.**
+
+## 2026-09-16 — Phase 3: full basecaller with silu_mul on NPU — PASS
+
+`~/p0/bin/slorado-npu basecaller -x cpu -C 128 sup@v5.0.0 reads_1k.blow5` (slorado `0565e1d`, openfish `ccbc046`):
+
+| run | mean | q1 | median | q3 | n |
+|---|---|---|---|---|---|
+| CPU (Phase 0) | 0.95612597 | 0.9435065 | 0.988506 | 0.9956615 | 1155 |
+| NPU silu_mul | 0.95459520 | 0.94265025 | 0.9881625 | 0.9957005 | 1164 |
+
+Gate (pre-registered, median within ±0.001 of CPU): Δ = −0.000344 → **PASS**. Exact sequence match 402/1000
+(40.2%), total bases −0.033%, mean identity −0.0015 (watch). Wall 25:39 vs 20:12 (shared machine, load 6–10);
+`ff` 940 s vs 607 s. `[nn_npu]` 738 calls, 11,808 launches: host in 271.8 s, kernel 55.6 s (4.7 ms/launch),
+host out 53.4 s. As expected for Tier 1, the NPU path is slower than torch CPU for this memory-bound op
+(≈516 ms vs ≈65 ms per call, CPU figure inferred from the ff delta).
+
+**silu_mul: Phases 0–3 PASS. G1 met.**

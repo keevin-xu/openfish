@@ -24,3 +24,13 @@
 - The Python invoker allocates and maps new BOs on every call: 73 ms per call vs 4.3 ms of kernel time at N=16.8M.
   Real SUP activations are *easier* than randn for bf16 SiLU-Mul (8.9e-3 vs 1.0e-2) because |gate| is smaller.
 - aircc compile of this 8-tile elementwise design takes ~0.2 s on the server (verified from a clean build dir).
+
+## 2026-09-16 (Phase 2, silu_mul in slorado)
+- C++ XRT: never pass `xrt::ext::bo` straight to `run.set_arg`; store/cast to `xrt::bo` (see debug_log).
+- bf16 is not IEEE fp16: 1/8/7 bits. f32→bf16 = round the 23-bit mantissa to 7 bits nearest-even, carry into the
+  exponent, overflow→inf. Validate host converters against `ml_dtypes` before trusting them.
+- slorado pads every batch to `-C` chunks: even a 1-read run makes full 128×1024×4096 silu_mul calls (18 per batch).
+- At N=268M per call, host-side layout split + f32→bf16 (8 threads) costs ~4× the NPU kernel time; the kernel is
+  not the bottleneck at this granularity. Expected for Tier 1 (memory-bound op).
+- make does not track -D flags: openfish's lib and slorado's objects must be rebuilt per variant
+  (`npu/scripts/build_slorado_variants.sh`); keep variant binaries in `~/p0/bin`, run with cwd = slorado root.
