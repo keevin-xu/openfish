@@ -174,6 +174,19 @@ void openfish_dequant_fp8_transpose_gpu(
 
 #endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+#ifdef HAVE_NPU
+
+// AMD XDNA2 NPU (openfish/npu). Host tensors are float32 on CPU.
+// in: [n_tokens, 2 * hidden_dim] rows of [y ‖ gate]; out: [n_tokens, hidden_dim].
+void openfish_silu_mul_npu(
+    const float *in,
+    float *out,
+    uint64_t n_tokens,
+    uint64_t hidden_dim
+);
+
+#endif // HAVE_NPU
+
 #ifdef __cplusplus
 }
 #endif

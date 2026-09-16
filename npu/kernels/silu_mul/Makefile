@@ -20,7 +20,6 @@ OUTPUT_FORMAT ?= xclbin
 # Serialize device access from outside with: flock -x -w 1800 $$NPU_LOCK make run
 NPU_TMPDIR ?= $(HOME)/.npu-tmp
 ARTIFACTS_DIR ?= $(srcdir)/../../artifacts
-ARTIFACT_BASE = silu_mul_n$(N)_t$(TILE_N)_h$(HERD_X)x$(HERD_Y)
 
 # Best config (see kernel_registry/details/SiLU_Mul_bf16.md): full chip width
 # at the fastest placeable tile. N = 2048*8192 is llama-3.2-1B prefill scale.
@@ -62,14 +61,10 @@ profile: compile-kernel
 		--n $(N) --tile-n $(TILE_N) --herd-x $(HERD_X) --herd-y $(HERD_Y) \
 		--perf-iters $(ITERATIONS)
 
-# openfish/npu: compile-only (no NPU) into ../../artifacts for build.sh
+# openfish/npu: compile-only (no NPU) ELF + silu_mul.json manifest into ../../artifacts (build.sh, nn_npu.cpp)
 artifact: compile-kernel
-	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/silu_and_mul.py --compile-mode compile-only \
-		--output-format xclbin --n $(N) --tile-n $(TILE_N) --herd-x $(HERD_X) --herd-y $(HERD_Y)
-	mkdir -p $(ARTIFACTS_DIR)
-	cp $(BUILD_DIR)/air.xclbin $(ARTIFACTS_DIR)/$(ARTIFACT_BASE).xclbin
-	cp $(BUILD_DIR)/air.insts.bin $(ARTIFACTS_DIR)/$(ARTIFACT_BASE).insts.bin
-	cd $(ARTIFACTS_DIR) && sha256sum $(ARTIFACT_BASE).xclbin $(ARTIFACT_BASE).insts.bin
+	cd $(BUILD_DIR) && $(PYTHON) $(srcdir)/build_artifact.py --n $(N) --tile-n $(TILE_N) \
+		--herd-x $(HERD_X) --herd-y $(HERD_Y) --out-dir $(ARTIFACTS_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR) __pycache__

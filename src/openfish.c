@@ -1,6 +1,10 @@
 #include <openfish/openfish.h>
 #include "decode.h"
 
+#ifdef HAVE_NPU
+#include "nn_npu.h"
+#endif
+
 openfish_opt_t openfish_decoder_default_opts(void) {
     openfish_opt_t opt = {100.0f, 2.0f, 0.0f, 1.0f};
     return opt;
@@ -24,3 +28,14 @@ size_t openfish_gpubuf_size(
         sizeof(float) * (size_t)batch_size * n_timesteps +                              // base_probs
         sizeof(float) * (size_t)batch_size * n_timesteps;                               // total_probs
 }
+
+#ifdef HAVE_NPU
+void openfish_silu_mul_npu(
+    const float *in,
+    float *out,
+    uint64_t n_tokens,
+    uint64_t hidden_dim
+) {
+    silu_mul_npu(in, out, n_tokens, hidden_dim);
+}
+#endif
