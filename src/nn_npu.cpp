@@ -133,7 +133,9 @@ struct elementwise_kernel_t {
     xrt::elf elf;
     xrt::hw_context ctx;
     xrt::ext::kernel kernel;
-    xrt::ext::bo bo_in0, bo_in1, bo_out;
+    // Held as xrt::bo: passing an xrt::ext::bo to run.set_arg() picks the scalar
+    // template overload and fails with "patch_value() only supports 64-bit values".
+    xrt::bo bo_in0, bo_in1, bo_out;
     uint16_t *in0 = nullptr, *in1 = nullptr, *out = nullptr;
     xrt::run run;
     npu_stats_t stats;
@@ -146,9 +148,9 @@ struct elementwise_kernel_t {
           elf(path),
           ctx(device, elf),
           kernel(ctx, manifest_field(json, "kernel_name")),
-          bo_in0(device, n * sizeof(uint16_t)),
-          bo_in1(device, n * sizeof(uint16_t)),
-          bo_out(device, n * sizeof(uint16_t)),
+          bo_in0(xrt::ext::bo(device, n * sizeof(uint16_t))),
+          bo_in1(xrt::ext::bo(device, n * sizeof(uint16_t))),
+          bo_out(xrt::ext::bo(device, n * sizeof(uint16_t))),
           in0(bo_in0.map<uint16_t *>()),
           in1(bo_in1.map<uint16_t *>()),
           out(bo_out.map<uint16_t *>()),
