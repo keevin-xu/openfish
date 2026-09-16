@@ -1,0 +1,8 @@
+# build outputs (see README)
+artifacts/*
+!artifacts/.gitkeep
+build_peano/
+air_project/
+*kernel_cache/
+__pycache__/
+test/fixtures/
