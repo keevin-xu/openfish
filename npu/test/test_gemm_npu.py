@@ -50,6 +50,9 @@ def main():
     ap.add_argument("--perf-iters", type=int, default=20)
     ap.add_argument("--dump-dir", default=os.environ.get("OPENFISH_DUMP_DIR"))
     ap.add_argument("--layer", type=int, default=0)
+    ap.add_argument("--mmul", choices=["bfp16", "native"], default="bfp16",
+                    help="bfp16: registry build (AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16, 8-elem shared-exponent "
+                         "8-bit-mantissa blocks); native: same mm_aie2p.cc without that define")
     args = ap.parse_args()
     d = Path(args.dump_dir or "")
     if not (d / "manifest.tsv").exists():
@@ -87,7 +90,12 @@ def main():
         tile_m = 64 if method == "fused-cast" else 32
         for c in (M % (tile_m * 8), K % 256, N % 512):
             assert c == 0, f"{name}: illegal tiling {M}x{K}x{N}"
-        subprocess.run(["make", "-s", "-C", str(KDIR), "compile-kernel", f"TILE_M={tile_m}"], check=True)
+        mk = subprocess.run(["make", "-s", "-n", "-C", str(KDIR), "compile-kernel", f"TILE_M={tile_m}"],
+                            check=True, capture_output=True, text=True).stdout
+        if args.mmul == "native":
+            assert "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16" in mk
+            mk = mk.replace("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16", "")
+        subprocess.run(mk, shell=True, check=True, cwd=KDIR, executable="/bin/bash")
         os.chdir(KDIR / "build_peano")
         if method == "fused-cast":
             module = gemm.build_module_gemm_cast(M, K, N, tile_m, **TILES, arch="aie2p")
@@ -107,12 +115,14 @@ def main():
         inputs = [a_bf, b_bf] + ([np.zeros((M, N), np.float32)] if method == "fused-cast" else [])
         invoke = backend.load(artifact)
         try:
-            out = invoke(*inputs, np.zeros((M, N), bfloat16))[len(inputs)].reshape(M, N)
+            res = invoke(*inputs, np.zeros((M, N), bfloat16))
+            out = res[len(inputs)].reshape(M, N)
+            f32_out = res[2].reshape(M, N) if method == "fused-cast" else None
         finally:
             backend.unload()
         lat_ms = backend.last_latency_us / 1e3
 
-        print(f"== {name} {M}x{K}x{N} {method} tile_m={tile_m} herd 8x4 ({fmt})")
+        print(f"== {name} {M}x{K}x{N} {method} tile_m={tile_m} herd 8x4 ({fmt}) mmul={args.mmul}")
         ok = checker._check_outputs([out], [expected], rtol=RTOL, atol=ATOL)
         all_ok &= ok
         o32 = out.astype(np.float32) + (bias if bias is not None else 0)
@@ -132,7 +142,14 @@ def main():
                  dump_mrl1=float(err.mean() / np.abs(cpu_out).mean()), dump_cos=cosine(o32, cpu_out),
                  dump_nfail=n_fail(o32, cpu_out), floor_mrl1=ref.compare(floor, cpu_out)["mean_rel_L1"],
                  npu_ms=lat_ms, cpu_ms=cpu_ms)
+        r["mmul"] = args.mmul
         results.append(r)
+        if f32_out is not None:
+            e32 = a_bf.astype(np.float32) @ b_bf.astype(np.float32)
+            fe = np.abs(f32_out - e32)
+            print(f"info fp32 intermediate (= bf16_in_fp32_out datapath): mean_rel_L1 {fe.mean() / np.abs(e32).mean():.3e} "
+                  f"abs_err max {fe.max():.3e} outside tol {n_fail(f32_out, e32)} "
+                  f"| vs CPU dump mean_rel_L1 {np.abs(f32_out + (bias if bias is not None else 0) - cpu_out).mean() / np.abs(cpu_out).mean():.3e}")
         print(f"info vs CPU dump: mean_rel_L1 {r['dump_mrl1']:.3e} cosine {r['dump_cos']:.8f} outside tol {r['dump_nfail']} "
               f"| bf16-input floor mean_rel_L1 {r['floor_mrl1']:.3e}")
         print(f"perf: NPU kernel-only mean {lat_ms:.2f} ms ({args.perf_iters} iters) vs torch fp32 8 thr median {cpu_ms:.2f} ms "
