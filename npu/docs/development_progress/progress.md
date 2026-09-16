@@ -84,3 +84,19 @@ host out 53.4 s. As expected for Tier 1, the NPU path is slower than torch CPU f
 (≈516 ms vs ≈65 ms per call, CPU figure inferred from the ff delta).
 
 **silu_mul: Phases 0–3 PASS. G1 met.**
+
+## 2026-09-16 — Tier 2 start: GEMM fc1+fc2 on NPU — Phase 2 + Phase 3 PASS
+
+Root cause of registry-tolerance failures on real data: BFP16 emulation in the aie2p mmul (bench/results.md).
+Integrated `openfish_linear_npu` (fused-cast ELF, M=4096, f32 accumulator output, resident bf16 weights,
+`OPENFISH_NPU_OPS`), both mmul variants. Phase 2 (18 layers): bfp16 enc_out cosine ≥ 0.9998, native ≥ 0.99999.
+Phase 3 (sup, reads_1k, -C 128, 16 host threads; pre-registered ±0.001):
+
+| variant | median | Δ vs CPU | wall | ff | CPU time |
+|---|---|---|---|---|---|
+| CPU | 0.988506 | — | 20:12 | 607 s | 14,327 s |
+| bfp16 | 0.988272 | −0.000234 PASS | 16:45 (−17%) | 411 s | 9,010 s |
+| native | 0.988550 | +0.000044 PASS | 27:38 (+37%) | 1,010 s | 9,844 s |
+
+bfp16 fc1: host in 21.6 s, kernel 102.7 s (4.3 ms/launch), host out 58.7 s; fc2: 62.0 / 40.8 / 14.2 s.
+Shared machine (load 5–10). First end-to-end NPU speedup; Phase 1 passes only for native.
