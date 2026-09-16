@@ -95,7 +95,7 @@ def main():
         else:
             module = gemm.build_module(M, K, N, tile_m, TILES["tile_k_l2"], TILES["tile_k_l1"], TILES["tile_n"],
                                        TILES["herd_m"], TILES["herd_n"], bfloat16, bfloat16, arch="aie2p",
-                                       emit_external_call=True, drain_chunks=None)
+                                       emit_external_call=True, drain_chunks=1)
             fmt, inst = "xclbin", "matmul_bf16"
         backend = XRTBackend(target_device="npu2", omit_while_true_loop=False, runtime_loop_tiling_sizes=[2, 2],
                              stack_size=2048, output_format=fmt, instance_name=inst, n_perf_iters=args.perf_iters)
