@@ -34,3 +34,24 @@ Findings:
 - **Speed:** kernel-only, the NPU GEMM is 2–6× faster than torch fp32 on the CPU at these shapes (best on fc1/fc2).
   Unlike silu_mul this op is compute-bound, so a real end-to-end win is plausible if host conversion is kept
   small (only the 512-wide side crosses when fc1→silu_mul→fc2 is fused).
+
+## 2026-09-16 — bf16 GEMM with real sup@v5.0.0 weights + activations (layer 0)
+
+`test/test_gemm_npu.py` (openfish `58ea484` + drain fix), dump `~/p0/dump_sup8`, M = 4096 rows (first 4 chunks),
+B = weight.T, same kernels/tiles as above. NPU kernel-only mean ×20; CPU torch fp32 8 threads median ×20 on the
+same A. Raw: server `~/p0/gemm_real.txt`, `~/p0/gemm_real_attn.txt`.
+
+| op | M×K×N | method | registry gate (rtol 1.6e-2, atol 1.5e-3) | outside tol | mean_rel_L1 vs fp32(A_bf16@B_bf16) | vs CPU dump mean_rel_L1 | vs CPU dump cosine | bf16-input floor mean_rel_L1 | NPU ms | CPU ms | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fc1 | 4096×512×4096 | fused-cast | FAIL | 1,686,580 (10.05%) | 7.819e-3 | 8.094e-3 | 0.99997199 | 2.094e-3 | 4.64 | 23.85 | 5.1× |
+| fc2 | 4096×2048×512 | fused-cast | FAIL | 169,038 (8.06%) | 8.077e-3 | 8.396e-3 | 0.99996687 | 2.303e-3 | 1.60 | 9.78 | 6.1× |
+| wqkv | 4096×512×1536 | drain | FAIL | 73,476 (1.17%) | 3.068e-3 | 3.565e-3 | 0.99999370 | 1.712e-3 | 2.04 | 6.58 | 3.2× |
+| out_proj | 4096×512×512 | drain | FAIL | 676 (0.03%) | 6.642e-3 | 6.480e-3 | 0.99998275 | 2.318e-3 | 0.71 | 2.09 | 3.0× |
+
+abs_err max: fc1 3.1e-2, fc2 2.0e-2, wqkv 1.6e-2, out_proj 7.8e-3.
+
+Real tensors are heavy-tailed (|x| max / median): ff_in 49, fc1 weight 43, silu_mul out 479, fc2 weight 20,
+attn_in 38, wqkv weight 56. **Hypothesis (unverified):** aie2p's GEMM emulates bf16 with BFP16 blocks of 8
+sharing one exponent (`AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16`), so small values in a block with an outlier lose
+precision; randn inputs don't exercise this. The error beyond the bf16-input floor (≈2e-3) is ≈1–6e-3 mean.
+Not a Phase-1 PASS for any linear; per-op cosine ≥ 0.99997 — the identity gate would have to decide.
