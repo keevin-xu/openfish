@@ -185,6 +185,20 @@ void openfish_silu_mul_npu(
     uint64_t hidden_dim
 );
 
+// Whether op is listed in OPENFISH_NPU_OPS (comma list; default "silu_mul").
+int openfish_npu_op_enabled(const char *op);
+
+// Bias-free linear on the NPU: out[n_rows, out_dim] = in[n_rows, in_dim] @ weight[out_dim, in_dim].T (float32).
+void openfish_linear_npu(
+    const char *op,
+    const float *in,
+    float *out,
+    const float *weight,
+    uint64_t n_rows,
+    uint64_t in_dim,
+    uint64_t out_dim
+);
+
 #endif // HAVE_NPU
 
 #ifdef __cplusplus

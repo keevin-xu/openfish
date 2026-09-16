@@ -38,4 +38,20 @@ void openfish_silu_mul_npu(
 ) {
     silu_mul_npu(in, out, n_tokens, hidden_dim);
 }
+
+int openfish_npu_op_enabled(const char *op) {
+    return npu_op_enabled(op);
+}
+
+void openfish_linear_npu(
+    const char *op,
+    const float *in,
+    float *out,
+    const float *weight,
+    uint64_t n_rows,
+    uint64_t in_dim,
+    uint64_t out_dim
+) {
+    linear_npu(op, in, out, weight, n_rows, in_dim, out_dim);
+}
 #endif

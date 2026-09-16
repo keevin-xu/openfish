@@ -4,7 +4,10 @@
 // kernels take bf16, so values are converted on the way in and out.
 //
 // Environment:
-//   OPENFISH_NPU_ARTIFACTS  directory with <kernel>.json manifests + artifacts (required)
+//   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default "silu_mul");
+//                           known: silu_mul, fc1, fc2
+//   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
+//   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)
 //   OPENFISH_NPU_THREADS    host threads for layout/bf16 conversion (default 8)
 //   NPU_LOCK                lock file taken with flock(LOCK_EX) for the process lifetime
 //                           (unless OPENFISH_NPU_NO_FLOCK=1); do not also wrap the
@@ -40,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -161,21 +165,76 @@ struct elementwise_kernel_t {
     }
 };
 
+// GEMM C[m,n] = A[m,k] @ B[k,n] from the registry fused-cast ELF (args A_bf16, B_bf16, C_f32, C_bf16).
+// The f32 scratch C is read back as the result (full-precision accumulator, no bf16 round trip).
+// B = weight.T is converted to bf16 once per weight tensor and kept resident.
+struct gemm_kernel_t {
+    std::string name;
+    std::string path;
+    uint64_t m = 0, k = 0, n = 0;
+    xrt::device device;
+    xrt::elf elf;
+    xrt::hw_context ctx;
+    xrt::ext::kernel kernel;
+    xrt::bo bo_a, bo_c32, bo_c16;
+    uint16_t *a = nullptr;
+    float *c32 = nullptr;
+    xrt::run run;
+    std::unordered_map<const float *, xrt::bo> weights;
+    npu_stats_t stats;
+
+    gemm_kernel_t(const std::string &op, const std::string &dir, const std::string &json)
+        : name(op),
+          path(dir + "/" + manifest_field(json, "file")),
+          m(std::stoull(manifest_field(json, "m"))),
+          k(std::stoull(manifest_field(json, "k"))),
+          n(std::stoull(manifest_field(json, "n"))),
+          device(0),
+          elf(path),
+          ctx(device, elf),
+          kernel(ctx, manifest_field(json, "kernel_name")),
+          bo_a(xrt::ext::bo(device, m * k * sizeof(uint16_t))),
+          bo_c32(xrt::ext::bo(device, m * n * sizeof(float))),
+          bo_c16(xrt::ext::bo(device, m * n * sizeof(uint16_t))),
+          a(bo_a.map<uint16_t *>()),
+          c32(bo_c32.map<float *>()),
+          run(kernel) {
+        run.set_arg(0, bo_a);
+        run.set_arg(2, bo_c32);
+        run.set_arg(3, bo_c16);
+    }
+};
+
 std::mutex g_mutex;
-elementwise_kernel_t *g_silu_mul = nullptr;  // intentionally never freed: avoids XRT static-destruction order at exit
+// Kernels are intentionally never freed: avoids XRT static-destruction order at exit.
+elementwise_kernel_t *g_silu_mul = nullptr;
+std::unordered_map<std::string, gemm_kernel_t *> g_gemm;
+std::vector<std::pair<std::string, const npu_stats_t *>> g_stats;
 int g_lock_fd = -1;
 int g_threads = 8;
+bool g_common_ready = false;
 
 void print_stats() {
-    const elementwise_kernel_t *k = g_silu_mul;
-    if (!k || !k->stats.calls) {
-        return;
+    for (const auto &it : g_stats) {
+        const npu_stats_t &s = *it.second;
+        if (!s.calls) {
+            continue;
+        }
+        fprintf(stderr,
+                "[nn_npu] %s: %lu calls, %lu launches, %lu elements; host in %.3f s, kernel %.3f s (%.1f ms/launch), host out %.3f s\n",
+                it.first.c_str(), (unsigned long)s.calls, (unsigned long)s.launches, (unsigned long)s.elements, s.t_in,
+                s.t_kernel, 1e3 * s.t_kernel / std::max<uint64_t>(s.launches, 1), s.t_out);
     }
-    const npu_stats_t &s = k->stats;
-    fprintf(stderr,
-            "[nn_npu] %s: %lu calls, %lu launches, %lu elements; host in %.3f s, kernel %.3f s (%.1f ms/launch), host out %.3f s\n",
-            k->name.c_str(), (unsigned long)s.calls, (unsigned long)s.launches, (unsigned long)s.elements, s.t_in,
-            s.t_kernel, 1e3 * s.t_kernel / std::max<uint64_t>(s.launches, 1), s.t_out);
+}
+
+std::string read_file(const std::string &path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("cannot read " + path);
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
 }
 
 void take_process_lock() {
@@ -196,26 +255,29 @@ void take_process_lock() {
     fprintf(stderr, "[nn_npu] holding lock %s for the process lifetime\n", lock);
 }
 
+void init_common() {
+    if (g_common_ready) {
+        return;
+    }
+    if (const char *t = std::getenv("OPENFISH_NPU_THREADS")) {
+        g_threads = std::max(1, std::atoi(t));
+    }
+    take_process_lock();
+    std::atexit(print_stats);
+    g_common_ready = true;
+}
+
 elementwise_kernel_t *load_silu_mul() {
     const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
     if (!dir) {
         throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
     }
-    if (const char *t = std::getenv("OPENFISH_NPU_THREADS")) {
-        g_threads = std::max(1, std::atoi(t));
-    }
     const std::string manifest = std::string(dir) + "/silu_mul.json";
-    std::ifstream in(manifest);
-    if (!in) {
-        throw std::runtime_error("cannot read " + manifest);
-    }
-    std::stringstream ss;
-    ss << in.rdbuf();
-    const std::string json = ss.str();
+    const std::string json = read_file(manifest);
     if (manifest_field(json, "format") != "elf" || manifest_field(json, "dtype") != "bf16") {
         throw std::runtime_error(manifest + ": expected format elf, dtype bf16");
     }
-    take_process_lock();
+    init_common();
     auto t0 = clock_type::now();
     auto *k = new elementwise_kernel_t("silu_mul", dir, json);
     struct stat st;
@@ -225,8 +287,35 @@ elementwise_kernel_t *load_silu_mul() {
             k->path.c_str(), (long)st.st_size, manifest_field(json, "sha256").c_str(),
             manifest_field(json, "kernel_name").c_str(), (unsigned long)k->n, manifest_field(json, "tile_n").c_str(),
             manifest_field(json, "herd").c_str(), g_threads, seconds_since(t0));
-    std::atexit(print_stats);
+    g_stats.emplace_back(k->name, &k->stats);
     return k;
+}
+
+gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
+    const char *dir = std::getenv("OPENFISH_NPU_GEMM_ARTIFACTS");
+    if (!dir) {
+        throw std::runtime_error("OPENFISH_NPU_GEMM_ARTIFACTS is not set");
+    }
+    const std::string manifest = std::string(dir) + "/gemm_k" + std::to_string(K) + "_n" + std::to_string(N) + ".json";
+    const std::string json = read_file(manifest);
+    if (manifest_field(json, "format") != "elf" || manifest_field(json, "method") != "fused-cast") {
+        throw std::runtime_error(manifest + ": expected format elf, method fused-cast");
+    }
+    init_common();
+    auto t0 = clock_type::now();
+    auto *g = new gemm_kernel_t(op, dir, json);
+    if (g->k != K || g->n != N) {
+        throw std::runtime_error(manifest + ": shape mismatch");
+    }
+    fprintf(stderr,
+            "[nn_npu] loaded %s: %s (sha256 %s), kernel %s, M=%lu K=%lu N=%lu, mmul %s, tiles m/kl2/kl1/n %s/%s/%s/%s herd %s, %.3f s\n",
+            op.c_str(), g->path.c_str(), manifest_field(json, "sha256").c_str(), manifest_field(json, "kernel_name").c_str(),
+            (unsigned long)g->m, (unsigned long)K, (unsigned long)N, manifest_field(json, "mmul").c_str(),
+            manifest_field(json, "tile_m").c_str(), manifest_field(json, "tile_k_l2").c_str(),
+            manifest_field(json, "tile_k_l1").c_str(), manifest_field(json, "tile_n").c_str(),
+            manifest_field(json, "herd").c_str(), seconds_since(t0));
+    g_stats.emplace_back(op, &g->stats);
+    return g;
 }
 
 }  // namespace
@@ -294,6 +383,100 @@ void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) {
         k.stats.elements += total;
     } catch (const std::exception &e) {
         OPENFISH_ERROR("silu_mul_npu: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+int npu_op_enabled(const char *op) {
+    static const std::vector<std::string> ops = [] {
+        std::vector<std::string> v;
+        const char *env = std::getenv("OPENFISH_NPU_OPS");
+        std::stringstream ss(env ? env : "silu_mul");
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) {
+                v.push_back(item);
+            }
+        }
+        std::string joined;
+        for (const auto &o : v) {
+            joined += (joined.empty() ? "" : ",") + o;
+        }
+        fprintf(stderr, "[nn_npu] ops on NPU: %s\n", joined.empty() ? "(none)" : joined.c_str());
+        return v;
+    }();
+    return std::find(ops.begin(), ops.end(), op) != ops.end();
+}
+
+void linear_npu(const char *op, const float *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        auto it = g_gemm.find(op);
+        if (it == g_gemm.end()) {
+            it = g_gemm.emplace(op, load_gemm(op, K, N)).first;
+        }
+        gemm_kernel_t &g = *it->second;
+        if (g.k != K || g.n != N) {
+            throw std::runtime_error(std::string(op) + ": runtime shape " + std::to_string(K) + "x" + std::to_string(N) +
+                                     " != compiled " + std::to_string(g.k) + "x" + std::to_string(g.n));
+        }
+
+        auto t0 = clock_type::now();
+        auto w = g.weights.find(weight);
+        if (w == g.weights.end()) {
+            // B[k, n] = weight[n, k].T, bf16, resident for the process lifetime
+            xrt::bo bo_b = xrt::ext::bo(g.device, K * N * sizeof(uint16_t));
+            uint16_t *b = bo_b.map<uint16_t *>();
+            parallel_for(K, g_threads, [&](uint64_t lo, uint64_t hi) {
+                for (uint64_t i = lo; i < hi; ++i) {
+                    for (uint64_t j = 0; j < N; ++j) {
+                        b[i * N + j] = f32_to_bf16(weight[j * K + i]);
+                    }
+                }
+            });
+            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            w = g.weights.emplace(weight, bo_b).first;
+        }
+        g.run.set_arg(1, w->second);
+
+        const uint64_t m = g.m;
+        const uint64_t launches = (rows + m - 1) / m;
+        g.stats.t_in += seconds_since(t0);
+        for (uint64_t l = 0; l < launches; ++l) {
+            const uint64_t begin = l * m;
+            const uint64_t count = std::min(m, rows - begin);
+
+            auto t1 = clock_type::now();
+            parallel_for(count * K, g_threads, [&](uint64_t lo, uint64_t hi) {
+                for (uint64_t i = lo; i < hi; ++i) {
+                    g.a[i] = f32_to_bf16(x[begin * K + i]);
+                }
+            });
+            if (count < m) {
+                std::memset(g.a + count * K, 0, (m - count) * K * sizeof(uint16_t));
+            }
+            g.bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto t2 = clock_type::now();
+
+            g.run.start();
+            if (g.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+                throw std::runtime_error(std::string(op) + " launch timed out after 60 s");
+            }
+            auto t3 = clock_type::now();
+
+            g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            std::memcpy(out + begin * N, g.c32, count * N * sizeof(float));
+            auto t4 = clock_type::now();
+
+            g.stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+            g.stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+            g.stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+        }
+        g.stats.calls += 1;
+        g.stats.launches += launches;
+        g.stats.elements += rows * N;
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("linear_npu(%s): %s", op, e.what());
         exit(EXIT_FAILURE);
     }
 }

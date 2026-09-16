@@ -6,3 +6,4 @@ air_project/
 *kernel_cache/
 __pycache__/
 test/fixtures/
+kernels/gemm_bf16/build_*/
