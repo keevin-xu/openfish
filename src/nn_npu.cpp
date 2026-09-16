@@ -466,8 +466,8 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
 
             g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             // parallel copy: the destination is a fresh torch tensor, so first-touch page faults dominate
-            parallel_for(count, g_threads, [&](uint64_t lo, uint64_t hi) {
-                std::memcpy(out + (begin + lo) * N, g.c32 + lo * N, (hi - lo) * N * sizeof(float));
+            parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
+                std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
             });
             auto t4 = clock_type::now();
 
