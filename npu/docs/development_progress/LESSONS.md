@@ -13,3 +13,14 @@
 - `slorado -C` (gpu batch size) also governs CPU memory: sup at the default 512 exceeds 30 GiB.
 - Build-flag trick without editing the Makefile: `CPPFLAGS=-DFOO make` (env var; the Makefile's `+=` appends).
   `make CPPFLAGS+=...` on the command line would *replace* the Makefile's include paths.
+
+## 2026-09-16 (Phase 1, silu_mul)
+- The installed `XRTRunner.run_test` locks `tempfile.gettempdir()/npu.lock`, i.e. `/tmp/npu.lock`, which another user
+  owns on zhang-ryzen2. Set `TMPDIR=~/.npu-tmp` for mlir-air example runs instead of patching mlir-air.
+- Don't take `$NPU_LOCK` inside a Python harness that is launched under `flock $NPU_LOCK`: the child inherits the
+  locked fd and a second open+flock would deadlock. Lock from outside only.
+- `XRTBackend.last_latency_us` is a **mean** over `n_perf_iters` (kernel-only, syncs excluded) — fine for registry
+  comparability; our own G2 timing must report median/p95.
+- The Python invoker allocates and maps new BOs on every call: 73 ms per call vs 4.3 ms of kernel time at N=16.8M.
+  Real SUP activations are *easier* than randn for bf16 SiLU-Mul (8.9e-3 vs 1.0e-2) because |gate| is smaller.
+- aircc compile of this 8-tile elementwise design takes ~0.2 s on the server (verified from a clean build dir).

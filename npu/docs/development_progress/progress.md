@@ -32,3 +32,20 @@ minimap2 2.24 + datamash 1.8 vs hg38noAlt.
    All < 1e-5 → PASS.
 
 **Phase 0: PASS** (all five gate items of `bc-phase-0-cpu-oracle`).
+
+## 2026-09-16 — Phase 1: silu_mul kernel validation — PASS
+
+Env: slorado `dbe9cab`, openfish `c1243fd` (npu-adapting), mlir-air wheel `0.0.1.2026090504+6746658`, XRT 2.21.75
+userspace, NPU FW 1.1.2.65, amdxdna-dkms 7.0.0-rc1+git20260310. NPU idle before runs. Lock: `flock $NPU_LOCK`.
+Dump: `~/p0/dump_sup8` (SUP L0, 8 rows; reference checks PASS on it too).
+
+- Stock kernel (`kernels/silu_mul`, copied unmodified from mlir-air `silu_and_mul`): `make run` PASS, `make profile`
+  4060.1 µs mean → 24.8 GB/s at N=16,777,216, 8×1 tiles, tile_n 4096 — reproduces the registry row.
+- openfish harness `test/test_silu_mul_npu.py` (exit 0): randn PASS (1.024e-2); **real SUP activations through the
+  `[y‖gate]` host split PASS (mean_rel_L1 8.858e-3, abs_err max 0.047)**; swapped negative control fails as required.
+- Gate: (1) harness exists ✓ (2) element-wise PASS on full output, mean_rel_L1 recorded ✓ (3) 8/8 tiles, target for
+  elementwise ✓ (4) registry row in `docs/registry_rows.md` (upstream via lab, not written into mlir-air) ✓.
+- Host adapter cost at this N: f32→bf16 cast 11–12 ms + split 7 ms; one invoke incl. BO allocation and syncs 73 ms
+  vs 4.3 ms kernel. Per-call BO allocation in the Python invoker dominates — the C backend must pre-allocate.
+
+**Phase 1 (silu_mul): PASS.** Details: `phase1_kernels.md`.
