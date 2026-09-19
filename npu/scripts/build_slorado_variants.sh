@@ -21,18 +21,20 @@ mkdir -p "$OUT"
 for v in $VARIANTS; do
     flags=""
     npu=()
+    ldpath="${LD_LIBRARY_PATH:-}"
     case "$v" in
         npu) npu=(npu=1) ;;
         npu-dump) npu=(npu=1); flags="-DOPENFISH_DUMP" ;;
         cpu) ;;
         cpu-dump) flags="-DOPENFISH_DUMP" ;;
-        rocm) npu=(rocm=1 "ROCM_ARCH=--offload-arch=gfx1151" "LIBTORCH_DIR=$LIBTORCH_ROCM") ;;
+        rocm) npu=(rocm=1 "ROCM_ARCH=--offload-arch=gfx1151" "LIBTORCH_DIR=$LIBTORCH_ROCM")
+              ldpath="/opt/rocm/lib" ;;  # libtorch's ROCm deps (hipblas, miopen, ...) resolve at link time too
         *) echo "unknown variant $v" >&2; exit 1 ;;
     esac
     echo "[variants] building $v (${npu[*]:-cpu} CPPFLAGS=$flags)"
     make -s -C openfish clean
     rm -f build/*.o build/*.d slorado
-    CPPFLAGS="$flags" make -s -j"$JOBS" cxx11_abi=1 "${npu[@]}"
+    CPPFLAGS="$flags" LD_LIBRARY_PATH="$ldpath" make -s -j"$JOBS" cxx11_abi=1 "${npu[@]}"
     cp slorado "$OUT/slorado-$v"
     echo "[variants] $OUT/slorado-$v $(sha256sum slorado | cut -c1-16)"
 done
