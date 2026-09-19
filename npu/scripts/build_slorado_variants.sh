@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build slorado binaries side by side into $OUT (default ~/p0/bin):
-#   slorado-npu-dump, slorado-npu, slorado-cpu-dump, slorado-cpu, slorado-rocm (iGPU)
+#   slorado-npu-dump, slorado-npu, slorado-cpu-dump, slorado-cpu,
+#   slorado-rocm, slorado-rocm-dump (iGPU), slorado-rocm-npu, slorado-rocm-npu-dump (iGPU + NPU)
 # The plain CPU build is built last, so ~/slorado/slorado stays the CPU oracle.
 # openfish's lib and slorado's objects depend on HAVE_NPU/OPENFISH_DUMP but make does not
 # track flags, so every variant is a clean rebuild. Run binaries with cwd = slorado root
@@ -27,7 +28,10 @@ for v in $VARIANTS; do
         npu-dump) npu=(npu=1); flags="-DOPENFISH_DUMP" ;;
         cpu) ;;
         cpu-dump) flags="-DOPENFISH_DUMP" ;;
-        rocm) npu=(rocm=1 "ROCM_ARCH=--offload-arch=gfx1151" "LIBTORCH_DIR=$LIBTORCH_ROCM")
+        rocm|rocm-dump|rocm-npu|rocm-npu-dump)
+              npu=(rocm=1 "ROCM_ARCH=--offload-arch=gfx1151" "LIBTORCH_DIR=$LIBTORCH_ROCM")
+              [[ "$v" == *npu* ]] && npu+=(npu=1)
+              [[ "$v" == *dump ]] && flags="-DOPENFISH_DUMP"
               ldpath="/opt/rocm/lib" ;;  # libtorch's ROCm deps (hipblas, miopen, ...) resolve at link time too
         *) echo "unknown variant $v" >&2; exit 1 ;;
     esac

@@ -12,7 +12,7 @@ extern "C" {
 // Split host-side into launches of the compiled N; the last launch is zero-padded.
 void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K);
 
-// Whether op (e.g. "silu_mul", "fc1", "fc2") is listed in OPENFISH_NPU_OPS (default "silu_mul").
+// Whether op (e.g. "silu_mul", "fc1", "fc2") is listed in OPENFISH_NPU_OPS (default: none).
 int npu_op_enabled(const char *op);
 
 // Linear without bias on the NPU (bf16 GEMM, fp32 result): out[rows, N] = x[rows, K] @ weight[N, K].T.

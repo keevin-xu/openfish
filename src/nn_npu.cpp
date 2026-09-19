@@ -4,7 +4,7 @@
 // kernels take bf16, so values are converted on the way in and out.
 //
 // Environment:
-//   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default "silu_mul");
+//   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default: none);
 //                           known: silu_mul, fc1, fc2
 //   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
 //   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)
@@ -391,7 +391,7 @@ int npu_op_enabled(const char *op) {
     static const std::vector<std::string> ops = [] {
         std::vector<std::string> v;
         const char *env = std::getenv("OPENFISH_NPU_OPS");
-        std::stringstream ss(env ? env : "silu_mul");
+        std::stringstream ss(env ? env : "");
         std::string item;
         while (std::getline(ss, item, ',')) {
             if (!item.empty()) {

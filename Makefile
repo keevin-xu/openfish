@@ -56,20 +56,19 @@ else ifdef rocm
 	CPPFLAGS += -DHAVE_ROCM=1
 	MAIN_CC = $(HIPCC)
 	MAIN_CFLAGS = -x hip $(ROCM_CFLAGS) -fPIC
-else ifdef npu
-	# AMD XDNA2 NPU (openfish/npu): CPU build plus XRT-invoked kernels; link slorado with -lxrt_coreutil
-	CXX ?= g++
-	NPU_CXXFLAGS += -g -Wall -O2 -std=c++17
-	NPU_OBJ += $(BUILD_DIR)/nn_npu.o
-	GPU_LIB = $(BUILD_DIR)/npu_code.a
-	NPU_LDFLAGS = -lxrt_coreutil -lstdc++
-	CPPFLAGS += -DHAVE_NPU=1
-	MAIN_CC = $(CC)
-	MAIN_CFLAGS = $(CFLAGS)
 else
 	GPU_LIB = $(BUILD_DIR)/cpu_decoy.a
 	MAIN_CC = $(CC)
 	MAIN_CFLAGS = $(CFLAGS)
+endif
+
+# AMD XDNA2 NPU (openfish/npu): XRT-invoked kernels, an add-on to the CPU or rocm build (npu=1 [rocm=1]);
+# link the final binary with -lxrt_coreutil
+ifdef npu
+	NPU_CXXFLAGS += -g -Wall -O2 -std=c++17 -fPIC
+	NPU_OBJ += $(BUILD_DIR)/nn_npu.o
+	NPU_LDFLAGS = -lxrt_coreutil -lstdc++
+	CPPFLAGS += -DHAVE_NPU=1
 endif
 
 ifdef bench
@@ -86,9 +85,9 @@ endif
 $(BINARY): $(BUILD_DIR)/main.o $(STATICLIB)
 	$(CC) $(CFLAGS) $(BUILD_DIR)/main.o $(STATICLIB) $(LDFLAGS) $(CUDA_LDFLAGS) $(ROCM_LDFLAGS) $(NPU_LDFLAGS) -o $@
 
-$(STATICLIB): $(OBJ) $(GPU_LIB)
+$(STATICLIB): $(OBJ) $(GPU_LIB) $(NPU_OBJ)
 	cp $(GPU_LIB) $@
-	$(AR) rcs $@ $(OBJ)
+	$(AR) rcs $@ $(OBJ) $(NPU_OBJ)
 
 $(BUILD_DIR)/main.o: src/main.c include/openfish/openfish.h
 	$(MAIN_CC) $(MAIN_CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -140,9 +139,6 @@ $(BUILD_DIR)/nn_hip.o: src/nn_hip.c
 	$(HIPCC) -x hip $(ROCM_CFLAGS) $(CPPFLAGS) $(DEPFLAGS) -fPIC -c $< -o $@
 
 # npu
-$(BUILD_DIR)/npu_code.a: $(NPU_OBJ)
-	$(AR) rcs $@ $^
-
 $(BUILD_DIR)/nn_npu.o: src/nn_npu.cpp src/nn_npu.h
 	$(CXX) $(NPU_CXXFLAGS) $(CPPFLAGS) $(DEPFLAGS) -c $< -o $@
 
