@@ -34,3 +34,12 @@
   not the bottleneck at this granularity. Expected for Tier 1 (memory-bound op).
 - make does not track -D flags: openfish's lib and slorado's objects must be rebuilt per variant
   (`npu/scripts/build_slorado_variants.sh`); keep variant binaries in `~/p0/bin`, run with cwd = slorado root.
+
+## 2026-09-19 (iGPU base)
+- ROCm on this box needs its own libtorch: the rocm6.4 wheel has no gfx1151 rocBLAS/hipBLASLt and bundles HIP .so.6.
+  AMD's `torch-2.9.1+rocm7.2.1.lw` links the system ROCm 7.2.1 — link and run with `/opt/rocm/lib` on LD_LIBRARY_PATH,
+  and never with `~/npu-env.sh` sourced (distro HSA 5.7.1 → "unrecognized id").
+- The iGPU runs SUP in fp16; every NPU substitution costs a GPU→host copy + fp16→fp32→bf16 and the reverse.
+- Load NPU kernels per K×N shape, not per op: 7 ops fit in 6 hw contexts (crf shares fc1's 512×4096 ELF).
+- The CRF linear failed 30.8% of elements at registry tolerance with the bfp16 GEMM yet kept identity within
+  0.0001 — the element-wise gate is far stricter than what basecalling needs; report both.

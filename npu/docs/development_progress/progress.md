@@ -100,3 +100,27 @@ Phase 3 (sup, reads_1k, -C 128, 16 host threads; pre-registered ±0.001):
 
 bfp16 fc1: host in 21.6 s, kernel 102.7 s (4.3 ms/launch), host out 58.7 s; fc2: 62.0 / 40.8 / 14.2 s.
 Shared machine (load 5–10). First end-to-end NPU speedup; Phase 1 passes only for native.
+
+## 2026-09-19 — iGPU base + NPU (coverage study, research-meeting direction)
+
+iGPU baseline (gfx1151, ROCm 7.2.1, libtorch 2.9.1+rocm7.2.1 in `~/torch-rocm72`, fp16): fast 5.1 s, hac 16.3 s,
+sup 179.8 s on reads_1k, all within ±0.0002 of CPU identity. `npu=1` became an add-on to `rocm=1`
+(`slorado-rocm-npu`): NPU hooks copy fp16 GPU tensors to host fp32 and back. Kernel targets and status:
+`npu-adapting/9-16-npu-adapting-session/kernel-targets-igpu-npu.md`.
+
+Per-op on the iGPU base (sup, reads_1k, -C 128; gate median ±0.001 of iGPU 0.9886105; Phase 2 18-layer cosine ≥ 0.99):
+
+| NPU op(s) | Phase 1 (real data) | Phase 2 | median | Δ vs iGPU | time (iGPU 179.8 s) | energy (iGPU ≈15.2 kJ) |
+|---|---|---|---|---|---|---|
+| fc1+fc2 bfp16 | FAIL element-wise, cos ≥ 0.99997 | PASS | 0.988557 | −0.000054 | 734.1 s | 47.7 kJ |
+| fc1+fc2 native | PASS | PASS | 0.988359 | −0.000252 | 1311.0 s | 61.6 kJ |
+| silu_mul | PASS | PASS | 0.988640 | +0.000030 | 695.5 s | 54.1 kJ |
+| fc1+fc2+silu_mul bfp16 | — | PASS | 0.988487 | −0.000124 | 1217.6 s | 76.8 kJ |
+| upsample bfp16 | FAIL 13.1% (native PASS) | PASS | 0.988528 | −0.000083 | 187.2 s | 15.8 kJ |
+| crf bfp16 | FAIL 30.8% (native PASS) | PASS | 0.988674 | +0.000064 | 213.7 s | 17.8 kJ |
+| out_proj bfp16 | FAIL 0.01% (native PASS) | PASS | 0.988557 | −0.000054 | 280.3 s | 23.4 kJ |
+| wqkv bfp16 | FAIL 1.1% (native PASS) | PASS | 0.988476 | −0.000135 | 346.6 s | 28.0 kJ |
+
+Every substitution is correct at the identity gate; none is faster or cheaper than the iGPU alone (GPU↔host copies
++ fp16/fp32/bf16 conversion + NPU kernels slower than the iGPU's). Cost scales with call count per read.
+Combined all-ops run (fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf): Phase 2 PASS (bfp16 and native); Phase 3 running.
