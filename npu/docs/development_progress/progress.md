@@ -124,3 +124,6 @@ Per-op on the iGPU base (sup, reads_1k, -C 128; gate median ±0.001 of iGPU 0.98
 Every substitution is correct at the identity gate; none is faster or cheaper than the iGPU alone (GPU↔host copies
 + fp16/fp32/bf16 conversion + NPU kernels slower than the iGPU's). Cost scales with call count per read.
 Combined all-ops run (fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf): Phase 2 PASS (bfp16 and native); Phase 3 running.
+
+Combined (all 7 ops on NPU, iGPU base): bfp16 median 0.9886465 (Δ +0.000036), 1516.2 s, 91.1 kJ; native 0.988411
+(Δ −0.0002), 2340.1 s, 111.9 kJ — both PASS; 8.4× / 13× slower than the iGPU alone. **P1 + P2 complete.**
