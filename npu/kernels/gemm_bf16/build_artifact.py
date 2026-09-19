@@ -31,7 +31,7 @@ assert M * K * N >= 4e9, "fused-cast is the registry choice only for M*K*N >= 4e
 for c in (M % (TILE["tile_m"] * TILE["herd_m"]), K % TILE["tile_k_l2"], N % (TILE["tile_n"] * TILE["herd_n"])):
     assert c == 0, f"illegal tiling for {M}x{K}x{N}"
 
-build = KDIR / f"build_{args.mmul}_k{K}_n{N}"
+build = KDIR / f"build_{args.mmul}_m{M}_k{K}_n{N}"
 mk = subprocess.run(["make", "-s", "-n", "-C", str(KDIR), "compile-kernel", f"TILE_M={TILE['tile_m']}"],
                     check=True, capture_output=True, text=True).stdout
 flag = "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16"

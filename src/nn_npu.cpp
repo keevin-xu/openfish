@@ -5,7 +5,8 @@
 //
 // Environment:
 //   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default: none);
-//                           known: silu_mul, fc1, fc2
+//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf
+//                           (GEMM ops share one loaded ELF per K x N shape, e.g. fc1 and crf)
 //   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
 //   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)
 //   OPENFISH_NPU_THREADS    host threads for layout/bf16 conversion (default 8)
@@ -208,7 +209,8 @@ struct gemm_kernel_t {
 std::mutex g_mutex;
 // Kernels are intentionally never freed: avoids XRT static-destruction order at exit.
 elementwise_kernel_t *g_silu_mul = nullptr;
-std::unordered_map<std::string, gemm_kernel_t *> g_gemm;
+std::unordered_map<std::string, gemm_kernel_t *> g_gemm;  // keyed by "<K>x<N>"
+std::unordered_map<std::string, npu_stats_t> g_op_stats;   // per op name (node addresses are stable)
 std::vector<std::pair<std::string, const npu_stats_t *>> g_stats;
 int g_lock_fd = -1;
 int g_threads = 8;
@@ -308,13 +310,12 @@ gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
         throw std::runtime_error(manifest + ": shape mismatch");
     }
     fprintf(stderr,
-            "[nn_npu] loaded %s: %s (sha256 %s), kernel %s, M=%lu K=%lu N=%lu, mmul %s, tiles m/kl2/kl1/n %s/%s/%s/%s herd %s, %.3f s\n",
-            op.c_str(), g->path.c_str(), manifest_field(json, "sha256").c_str(), manifest_field(json, "kernel_name").c_str(),
-            (unsigned long)g->m, (unsigned long)K, (unsigned long)N, manifest_field(json, "mmul").c_str(),
+            "[nn_npu] loaded gemm %lux%lu for %s: %s (sha256 %s), kernel %s, M=%lu, mmul %s, tiles m/kl2/kl1/n %s/%s/%s/%s herd %s, %.3f s\n",
+            (unsigned long)K, (unsigned long)N, op.c_str(), g->path.c_str(), manifest_field(json, "sha256").c_str(),
+            manifest_field(json, "kernel_name").c_str(), (unsigned long)g->m, manifest_field(json, "mmul").c_str(),
             manifest_field(json, "tile_m").c_str(), manifest_field(json, "tile_k_l2").c_str(),
             manifest_field(json, "tile_k_l1").c_str(), manifest_field(json, "tile_n").c_str(),
             manifest_field(json, "herd").c_str(), seconds_since(t0));
-    g_stats.emplace_back(op, &g->stats);
     return g;
 }
 
@@ -411,11 +412,18 @@ int npu_op_enabled(const char *op) {
 void linear_npu(const char *op, const float *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
-        auto it = g_gemm.find(op);
+        const std::string key = std::to_string(K) + "x" + std::to_string(N);
+        auto it = g_gemm.find(key);
         if (it == g_gemm.end()) {
-            it = g_gemm.emplace(op, load_gemm(op, K, N)).first;
+            it = g_gemm.emplace(key, load_gemm(op, K, N)).first;
         }
         gemm_kernel_t &g = *it->second;
+        auto st = g_op_stats.find(op);
+        if (st == g_op_stats.end()) {
+            st = g_op_stats.emplace(op, npu_stats_t()).first;
+            g_stats.emplace_back(op, &st->second);
+        }
+        npu_stats_t &stats = st->second;
         if (g.k != K || g.n != N) {
             throw std::runtime_error(std::string(op) + ": runtime shape " + std::to_string(K) + "x" + std::to_string(N) +
                                      " != compiled " + std::to_string(g.k) + "x" + std::to_string(g.n));
@@ -441,7 +449,7 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
 
         const uint64_t m = g.m;
         const uint64_t launches = (rows + m - 1) / m;
-        g.stats.t_in += seconds_since(t0);
+        stats.t_in += seconds_since(t0);
         for (uint64_t l = 0; l < launches; ++l) {
             const uint64_t begin = l * m;
             const uint64_t count = std::min(m, rows - begin);
@@ -471,13 +479,13 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
             });
             auto t4 = clock_type::now();
 
-            g.stats.t_in += std::chrono::duration<double>(t2 - t1).count();
-            g.stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
-            g.stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+            stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+            stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+            stats.t_out += std::chrono::duration<double>(t4 - t3).count();
         }
-        g.stats.calls += 1;
-        g.stats.launches += launches;
-        g.stats.elements += rows * N;
+        stats.calls += 1;
+        stats.launches += launches;
+        stats.elements += rows * N;
     } catch (const std::exception &e) {
         OPENFISH_ERROR("linear_npu(%s): %s", op, e.what());
         exit(EXIT_FAILURE);

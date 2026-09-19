@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Phase-1 harness: registry bf16 GEMM on NPU2 with real slorado sup@v5.0.0 weights and activations.
 
-For each linear (fc1, fc2, wqkv, out_proj) at M rows per launch: A = dumped layer input (first M rows
-of the 1024-long chunks), B = weight.T, one compile, one launch; checks
+For each linear (fc1, fc2, wqkv, out_proj, upsample, crf) at its production M rows per launch
+(DEFAULT_M; same shapes as kernels/gemm_bf16/build_artifacts.sh): A = dumped layer input (first M rows),
+B = weight.T, one compile, one launch; checks
   gate: element-wise vs fp32 A@B from the bf16-cast inputs (registry protocol, rtol 1.6e-2 / atol 1.5e-3)
   info: vs slorado's CPU fp32 dump output (bias added host-side for out_proj), cosine, n outside tol
   info: CPU floor = the same fp32 reference from bf16 inputs vs the dump (input-rounding error alone)
@@ -10,7 +11,8 @@ and kernel-only latency (XRTBackend perf mode, mean) next to torch fp32 linear o
 Exit 0 only if every op passes the gate.
 
   source ~/npu-env.sh && cd ~/slorado/openfish/npu
-  OPENFISH_DUMP_DIR=~/p0/dump_sup8 flock -x -w 1800 $NPU_LOCK python3 test/test_gemm_npu.py [--ops fc1 fc2]
+  OPENFISH_DUMP_DIR=~/p0/dump_sup16 flock -x -w 1800 $NPU_LOCK python3 test/test_gemm_npu.py [--ops fc1 fc2]
+The dump needs >= 16 rows (out_proj M=16384) and the tail (OPENFISH_DUMP_TAIL=1) for upsample/crf.
 """
 
 import argparse
@@ -30,6 +32,7 @@ sys.path.insert(0, str(KDIR))
 import reference as ref  # noqa: E402
 
 RTOL, ATOL = 1.6e-2, 1.5e-3
+DEFAULT_M = {"fc1": 4096, "fc2": 4096, "wqkv": 8192, "out_proj": 16384, "upsample": 8192, "crf": 4096}
 TILES = dict(tile_k_l2=256, tile_k_l1=32, tile_n=128, herd_m=8, herd_n=4)
 
 
@@ -45,8 +48,8 @@ def cosine(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ops", nargs="+", default=["fc1", "fc2", "wqkv", "out_proj"])
-    ap.add_argument("--m", type=int, default=4096)
+    ap.add_argument("--ops", nargs="+", default=list(DEFAULT_M))
+    ap.add_argument("--m", type=int, default=None, help="override rows per launch for every op")
     ap.add_argument("--perf-iters", type=int, default=20)
     ap.add_argument("--dump-dir", default=os.environ.get("OPENFISH_DUMP_DIR"))
     ap.add_argument("--layer", type=int, default=0)
@@ -59,19 +62,25 @@ def main():
         print(f"FAIL: no dump at {d}")
         return 2
     L = lambda s: np.load(d / f"L{args.layer}_{s}.npy")  # noqa: E731
-    M = args.m
+    T = lambda s: np.load(d / f"L99_{s}.npy")  # noqa: E731  (tail: OPENFISH_DUMP_TAIL)
 
-    def rows(x):  # [B, T, C] -> first M rows as [M, C]
+    def rows(x, m):  # [B, T, C] -> first m rows as [m, C]
         x = x.reshape(-1, x.shape[-1])
-        assert x.shape[0] >= M, f"dump has {x.shape[0]} rows < M={M}"
-        return np.ascontiguousarray(x[:M], dtype=np.float32)
+        assert x.shape[0] >= m, f"dump has {x.shape[0]} rows < M={m}"
+        return np.ascontiguousarray(x[:m], dtype=np.float32)
 
-    qkv = L("attn_qkv_linear_out")
-    ops = {
-        "fc1": (rows(L("ff_in")), L("ff_fc1_weight"), None, rows(L("ff_fc1_out"))),
-        "fc2": (rows(L("ff_silu_mul_out")), L("ff_fc2_weight"), None, rows(L("ff_fc2_out"))),
-        "wqkv": (rows(L("attn_in")), L("attn_wqkv_weight"), None, rows(qkv.reshape(*qkv.shape[:2], -1))),
-        "out_proj": (rows(L("attn_sdpa_out")), L("attn_out_proj_weight"), L("attn_out_proj_bias"), rows(L("attn_out_proj_out"))),
+    # name -> (input site loader, weight, bias, expected loader); rows are cut once M is known
+    specs = {
+        "fc1": (lambda: L("ff_in"), lambda: L("ff_fc1_weight"), lambda: None, lambda: L("ff_fc1_out")),
+        "fc2": (lambda: L("ff_silu_mul_out"), lambda: L("ff_fc2_weight"), lambda: None, lambda: L("ff_fc2_out")),
+        "wqkv": (lambda: L("attn_in"), lambda: L("attn_wqkv_weight"), lambda: None,
+                 lambda: L("attn_qkv_linear_out").reshape(-1, 1536)),
+        "out_proj": (lambda: L("attn_sdpa_out"), lambda: L("attn_out_proj_weight"), lambda: L("attn_out_proj_bias"),
+                     lambda: L("attn_out_proj_out")),
+        # upsample: linear(x) [.., 1024] reshaped to [N, 2T, 512]; undo the (pure view) reshape
+        "upsample": (lambda: T("tail_up_in"), lambda: T("tail_up_weight"), lambda: T("tail_up_bias"),
+                     lambda: T("tail_up_out").reshape(-1, 1024)),
+        "crf": (lambda: T("tail_up_out"), lambda: T("tail_crf_weight"), lambda: None, lambda: T("tail_crf_out")),
     }
 
     import torch
@@ -84,7 +93,9 @@ def main():
     results = []
     all_ok = True
     for name in args.ops:
-        a32, w, bias, cpu_out = ops[name]
+        M = args.m or DEFAULT_M[name]
+        src, wl, bl, el = specs[name]
+        a32, w, bias, cpu_out = rows(src(), M), wl(), bl(), rows(el(), M)
         K, N = a32.shape[1], w.shape[0]
         method = "fused-cast" if M * K * N >= 4e9 else "drain"
         tile_m = 64 if method == "fused-cast" else 32
