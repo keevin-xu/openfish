@@ -5,7 +5,7 @@
 //
 // Environment:
 //   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default: none);
-//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf, rmsnorm, rope
+//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf, rmsnorm, rope, conv
 //                           (GEMM ops share one loaded ELF per K x N shape, e.g. fc1 and crf)
 //   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
 //   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)

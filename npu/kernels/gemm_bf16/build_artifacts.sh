@@ -7,7 +7,9 @@
 # Usage: [SHAPES="M K N ..."] build_artifacts.sh
 set -euo pipefail
 KDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHAPES="${SHAPES:-4096 512 4096 4096 2048 512 8192 512 1536 16384 512 512 8192 512 1024}"
+# conv stack (sup) via im2col, K and N zero-padded: conv1 K 5->256, conv2 320->512 (shares out_proj's 512x512),
+#   conv3/conv5 576/640->768, conv4 1152->1280; N (64/128/512) -> 512
+SHAPES="${SHAPES:-4096 512 4096 4096 2048 512 8192 512 1536 16384 512 512 8192 512 1024 32768 256 512 16384 768 512 16384 1280 512}"
 set -- $SHAPES
 shapes=("$@")
 for mmul in bfp16 native; do
