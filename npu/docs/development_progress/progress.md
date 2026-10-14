@@ -134,3 +134,10 @@ Combined (all 7 ops on NPU, iGPU base): bfp16 median 0.9886465 (Δ +0.000036), 1
 50-read run with fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf, rmsnorm, rope on the NPU (iGPU base): 117.3 s vs
 10.2 s iGPU-only; median identity 0.9708615 vs 0.978155 (−0.0073, fails ±0.001). Suspect bf16 residual stream
 through RMSNorm. Needs Phase 1/2 for rmsnorm and rope and an ablation before any further use.
+
+## 2026-10-14 — conv stack on the NPU (im2col + GEMM); fused FFN blocked
+
+Conv: `CRFModel.cpp` `conv1d_npu` (op `conv`) + 3 new GEMM shapes. 50 reads, conv only: bfp16 median −0.019 vs
+iGPU, native −0.0012 (path correct; bfp16 block emulation loses the raw-signal precision). All 10 ops (bfp16):
+116.3 s vs 10.2 s, median −0.024. Fused FFN: upstream `llms/shared/infra/ffn_swiglu/run.py` raises ValueError
+in `_build_gemm_module` (missing method flag) — needs our own multi-launch stitching.
