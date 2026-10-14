@@ -25,6 +25,12 @@ void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_
 
 void linear_npu(const char *op, const float *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N);
 
+// bf16 host I/O variants (raw bf16 bit patterns), used when tensors come from the iGPU
+void silu_mul_npu_bf16(const uint16_t *x, uint16_t *o, uint64_t MN, uint64_t K);
+void linear_npu_bf16(const char *op, const uint16_t *x, uint16_t *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N);
+void rmsnorm_npu_bf16(const uint16_t *x, const float *weight, uint16_t *y, uint64_t rows, uint64_t N);
+void rope_npu_bf16(const uint16_t *x, const float *lut, uint16_t *y, uint64_t rows, uint64_t head_dim);
+
 #ifdef __cplusplus
 }
 #endif

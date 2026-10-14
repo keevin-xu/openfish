@@ -62,4 +62,18 @@ void openfish_rmsnorm_npu(const float *in, const float *weight, float *out, uint
 void openfish_rope_npu(const float *in, const float *lut, float *out, uint64_t n_rows, uint64_t head_dim) {
     rope_npu(in, lut, out, n_rows, head_dim);
 }
+
+void openfish_silu_mul_npu_bf16(const uint16_t *in, uint16_t *out, uint64_t n_tokens, uint64_t hidden_dim) {
+    silu_mul_npu_bf16(in, out, n_tokens, hidden_dim);
+}
+void openfish_linear_npu_bf16(const char *op, const uint16_t *in, uint16_t *out, const float *weight, uint64_t n_rows,
+                              uint64_t in_dim, uint64_t out_dim) {
+    linear_npu_bf16(op, in, out, weight, n_rows, in_dim, out_dim);
+}
+void openfish_rmsnorm_npu_bf16(const uint16_t *in, const float *weight, uint16_t *out, uint64_t n_rows, uint64_t dim) {
+    rmsnorm_npu_bf16(in, weight, out, n_rows, dim);
+}
+void openfish_rope_npu_bf16(const uint16_t *in, const float *lut, uint16_t *out, uint64_t n_rows, uint64_t head_dim) {
+    rope_npu_bf16(in, lut, out, n_rows, head_dim);
+}
 #endif

@@ -44,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -83,6 +84,13 @@ inline uint16_t f32_to_bf16(float f) {
     }
     return (uint16_t)((sign << 15) | (ex << 7) | q);
 }
+
+inline uint16_t to_bf16(float v) { return f32_to_bf16(v); }
+inline uint16_t to_bf16(uint16_t v) { return v; }
+
+inline float bf16_to_f32(uint16_t h);
+inline void store_bf16(float &d, uint16_t h) { d = bf16_to_f32(h); }
+inline void store_bf16(uint16_t &d, uint16_t h) { d = h; }
 
 inline float bf16_to_f32(uint16_t h) {
     uint32_t b = ((uint32_t)(h >> 15) << 31) | ((uint32_t)((h >> 7) & 0xff) << 23) | ((uint32_t)(h & 0x7f) << 16);
@@ -180,6 +188,7 @@ struct gemm_kernel_t {
     xrt::bo bo_a, bo_c32, bo_c16;
     uint16_t *a = nullptr;
     float *c32 = nullptr;
+    uint16_t *c16 = nullptr;
     xrt::run run;
     std::unordered_map<const float *, xrt::bo> weights;
     npu_stats_t stats;
@@ -199,6 +208,7 @@ struct gemm_kernel_t {
           bo_c16(xrt::ext::bo(device, m * n * sizeof(uint16_t))),
           a(bo_a.map<uint16_t *>()),
           c32(bo_c32.map<float *>()),
+          c16(bo_c16.map<uint16_t *>()),
           run(kernel) {
         run.set_arg(0, bo_a);
         run.set_arg(2, bo_c32);
@@ -321,7 +331,8 @@ gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
 
 }  // namespace
 
-void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) {
+template <typename In, typename Out>
+static void silu_mul_impl(const In *x, Out *o, uint64_t MN, uint64_t K) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         if (!g_silu_mul) {
@@ -347,10 +358,10 @@ void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) {
             parallel_for(count, g_threads, [&](uint64_t a, uint64_t b) {
                 for (uint64_t i = a; i < b; ++i) {
                     const uint64_t e = begin + i;
-                    const float *row = x + (e / K) * 2 * K;
+                    const In *row = x + (e / K) * 2 * K;
                     const uint64_t col = e % K;
-                    k.in0[i] = f32_to_bf16(row[K + col]);
-                    k.in1[i] = f32_to_bf16(row[col]);
+                    k.in0[i] = to_bf16(row[K + col]);
+                    k.in1[i] = to_bf16(row[col]);
                 }
             });
             if (count < n) {
@@ -370,7 +381,7 @@ void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) {
             k.bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             parallel_for(count, g_threads, [&](uint64_t a, uint64_t b) {
                 for (uint64_t i = a; i < b; ++i) {
-                    o[begin + i] = bf16_to_f32(k.out[i]);
+                    store_bf16(o[begin + i], k.out[i]);
                 }
             });
             auto t3 = clock_type::now();
@@ -409,7 +420,8 @@ int npu_op_enabled(const char *op) {
     return std::find(ops.begin(), ops.end(), op) != ops.end();
 }
 
-void linear_npu(const char *op, const float *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N) {
+template <typename In, typename Out>
+static void linear_impl(const char *op, const In *x, Out *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         const std::string key = std::to_string(K) + "x" + std::to_string(N);
@@ -457,7 +469,7 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
             auto t1 = clock_type::now();
             parallel_for(count * K, g_threads, [&](uint64_t lo, uint64_t hi) {
                 for (uint64_t i = lo; i < hi; ++i) {
-                    g.a[i] = f32_to_bf16(x[begin * K + i]);
+                    g.a[i] = to_bf16(x[begin * K + i]);
                 }
             });
             if (count < m) {
@@ -472,11 +484,17 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
             }
             auto t3 = clock_type::now();
 
-            g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            // parallel copy: the destination is a fresh torch tensor, so first-touch page faults dominate
-            parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
-                std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
-            });
+            if constexpr (std::is_same<Out, float>::value) {
+                g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // fp32 accumulator
+                parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
+                    std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
+                });
+            } else {
+                g.bo_c16.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // bf16 output of the cast launch
+                parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
+                    std::memcpy(out + begin * N + lo, g.c16 + lo, (hi - lo) * sizeof(uint16_t));
+                });
+            }
             auto t4 = clock_type::now();
 
             stats.t_in += std::chrono::duration<double>(t2 - t1).count();
@@ -562,7 +580,8 @@ npu_stats_t &op_stats(const char *op) {
 }
 
 // Row-chunked launch: x[rows, n] -> y[rows, n]; buffer b holds `bconst` (b elements), uploaded when it changes.
-void run_rows(kernel3_t &k, npu_stats_t &stats, const float *x, float *y, uint64_t rows, const float *bconst) {
+template <typename In, typename Out>
+void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t rows, const float *bconst) {
     auto t0 = clock_type::now();
     if (k.b_key != bconst) {
         parallel_for(k.b, g_threads, [&](uint64_t lo, uint64_t hi) {
@@ -578,7 +597,7 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const float *x, float *y, uint64
         const uint64_t count = std::min(k.m, rows - begin);
         auto t1 = clock_type::now();
         parallel_for(count * k.n, g_threads, [&](uint64_t lo, uint64_t hi) {
-            for (uint64_t i = lo; i < hi; ++i) k.pa[i] = f32_to_bf16(x[begin * k.n + i]);
+            for (uint64_t i = lo; i < hi; ++i) k.pa[i] = to_bf16(x[begin * k.n + i]);
         });
         if (count < k.m) std::memset(k.pa + count * k.n, 0, (k.m - count) * k.n * sizeof(uint16_t));
         k.bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -590,7 +609,7 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const float *x, float *y, uint64
         auto t3 = clock_type::now();
         k.bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         parallel_for(count * k.n, g_threads, [&](uint64_t lo, uint64_t hi) {
-            for (uint64_t i = lo; i < hi; ++i) y[begin * k.n + i] = bf16_to_f32(k.pc[i]);
+            for (uint64_t i = lo; i < hi; ++i) store_bf16(y[begin * k.n + i], k.pc[i]);
         });
         auto t4 = clock_type::now();
         stats.t_in += std::chrono::duration<double>(t2 - t1).count();
@@ -604,7 +623,8 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const float *x, float *y, uint64
 
 }  // namespace
 
-void rmsnorm_npu(const float *x, const float *weight, float *y, uint64_t rows, uint64_t N) {
+template <typename T>
+static void rmsnorm_impl(const T *x, const float *weight, T *y, uint64_t rows, uint64_t N) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         kernel3_t &k = get_kernel3("rmsnorm_n" + std::to_string(N));
@@ -616,7 +636,8 @@ void rmsnorm_npu(const float *x, const float *weight, float *y, uint64_t rows, u
     }
 }
 
-void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_t head_dim) {
+template <typename T>
+static void rope_impl(const T *x, const float *lut, T *y, uint64_t rows, uint64_t head_dim) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         kernel3_t &k = get_kernel3("rope_d" + std::to_string(head_dim));
@@ -630,3 +651,17 @@ void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_
         exit(EXIT_FAILURE);
     }
 }
+
+// float32 host I/O (CPU build) and bf16 host I/O (iGPU build: tensors cast fp16 -> bf16 on the GPU)
+void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
+void silu_mul_npu_bf16(const uint16_t *x, uint16_t *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
+void linear_npu(const char *op, const float *x, float *out, const float *w, uint64_t rows, uint64_t K, uint64_t N) {
+    linear_impl(op, x, out, w, rows, K, N);
+}
+void linear_npu_bf16(const char *op, const uint16_t *x, uint16_t *out, const float *w, uint64_t rows, uint64_t K, uint64_t N) {
+    linear_impl(op, x, out, w, rows, K, N);
+}
+void rmsnorm_npu(const float *x, const float *w, float *y, uint64_t rows, uint64_t N) { rmsnorm_impl(x, w, y, rows, N); }
+void rmsnorm_npu_bf16(const uint16_t *x, const float *w, uint16_t *y, uint64_t rows, uint64_t N) { rmsnorm_impl(x, w, y, rows, N); }
+void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_t d) { rope_impl(x, lut, y, rows, d); }
+void rope_npu_bf16(const uint16_t *x, const float *lut, uint16_t *y, uint64_t rows, uint64_t d) { rope_impl(x, lut, y, rows, d); }

@@ -202,6 +202,13 @@ void openfish_linear_npu(
 void openfish_rmsnorm_npu(const float *in, const float *weight, float *out, uint64_t n_rows, uint64_t dim);
 void openfish_rope_npu(const float *in, const float *lut, float *out, uint64_t n_rows, uint64_t head_dim);
 
+// bf16 host I/O variants (raw bf16 bit patterns as uint16_t)
+void openfish_silu_mul_npu_bf16(const uint16_t *in, uint16_t *out, uint64_t n_tokens, uint64_t hidden_dim);
+void openfish_linear_npu_bf16(const char *op, const uint16_t *in, uint16_t *out, const float *weight, uint64_t n_rows,
+                              uint64_t in_dim, uint64_t out_dim);
+void openfish_rmsnorm_npu_bf16(const uint16_t *in, const float *weight, uint16_t *out, uint64_t n_rows, uint64_t dim);
+void openfish_rope_npu_bf16(const uint16_t *in, const float *lut, uint16_t *out, uint64_t n_rows, uint64_t head_dim);
+
 #endif // HAVE_NPU
 
 #ifdef __cplusplus
