@@ -5,7 +5,7 @@
 //
 // Environment:
 //   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default: none);
-//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf
+//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf, rmsnorm, rope
 //                           (GEMM ops share one loaded ELF per K x N shape, e.g. fc1 and crf)
 //   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
 //   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)
@@ -488,6 +488,145 @@ void linear_npu(const char *op, const float *x, float *out, const float *weight,
         stats.elements += rows * N;
     } catch (const std::exception &e) {
         OPENFISH_ERROR("linear_npu(%s): %s", op, e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+// ---- generic 3-buffer bf16 kernels (rmsnorm: X, W, Y; rope: src, lut, dst), manifest <name>.json in
+// OPENFISH_NPU_ARTIFACTS with element counts a, b, c and rows-per-launch m.
+namespace {
+
+struct kernel3_t {
+    std::string name;
+    uint64_t m = 0, n = 0, a = 0, b = 0, c = 0;
+    xrt::device device;
+    xrt::elf elf;
+    xrt::hw_context ctx;
+    xrt::ext::kernel kernel;
+    xrt::bo bo_a, bo_b, bo_c;
+    uint16_t *pa = nullptr, *pb = nullptr, *pc = nullptr;
+    xrt::run run;
+    const void *b_key = nullptr;  // host pointer whose contents are currently in bo_b
+
+    kernel3_t(const std::string &nm, const std::string &dir, const std::string &json)
+        : name(nm),
+          m(std::stoull(manifest_field(json, "m"))),
+          n(std::stoull(manifest_field(json, "n"))),
+          a(std::stoull(manifest_field(json, "a"))),
+          b(std::stoull(manifest_field(json, "b"))),
+          c(std::stoull(manifest_field(json, "c"))),
+          device(0),
+          elf(dir + "/" + manifest_field(json, "file")),
+          ctx(device, elf),
+          kernel(ctx, manifest_field(json, "kernel_name")),
+          bo_a(xrt::ext::bo(device, a * sizeof(uint16_t))),
+          bo_b(xrt::ext::bo(device, b * sizeof(uint16_t))),
+          bo_c(xrt::ext::bo(device, c * sizeof(uint16_t))),
+          pa(bo_a.map<uint16_t *>()),
+          pb(bo_b.map<uint16_t *>()),
+          pc(bo_c.map<uint16_t *>()),
+          run(kernel) {
+        run.set_arg(0, bo_a);
+        run.set_arg(1, bo_b);
+        run.set_arg(2, bo_c);
+    }
+};
+
+std::unordered_map<std::string, kernel3_t *> g_k3;
+
+kernel3_t &get_kernel3(const std::string &name) {
+    auto it = g_k3.find(name);
+    if (it != g_k3.end()) {
+        return *it->second;
+    }
+    const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
+    if (!dir) {
+        throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
+    }
+    const std::string json = read_file(std::string(dir) + "/" + name + ".json");
+    init_common();
+    auto *k = new kernel3_t(name, dir, json);
+    fprintf(stderr, "[nn_npu] loaded %s: %s/%s (sha256 %s), kernel %s, m=%lu n=%lu\n", name.c_str(), dir,
+            manifest_field(json, "file").c_str(), manifest_field(json, "sha256").c_str(),
+            manifest_field(json, "kernel_name").c_str(), (unsigned long)k->m, (unsigned long)k->n);
+    return *g_k3.emplace(name, k).first->second;
+}
+
+npu_stats_t &op_stats(const char *op) {
+    auto st = g_op_stats.find(op);
+    if (st == g_op_stats.end()) {
+        st = g_op_stats.emplace(op, npu_stats_t()).first;
+        g_stats.emplace_back(op, &st->second);
+    }
+    return st->second;
+}
+
+// Row-chunked launch: x[rows, n] -> y[rows, n]; buffer b holds `bconst` (b elements), uploaded when it changes.
+void run_rows(kernel3_t &k, npu_stats_t &stats, const float *x, float *y, uint64_t rows, const float *bconst) {
+    auto t0 = clock_type::now();
+    if (k.b_key != bconst) {
+        parallel_for(k.b, g_threads, [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) k.pb[i] = f32_to_bf16(bconst[i]);
+        });
+        k.bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        k.b_key = bconst;
+    }
+    stats.t_in += seconds_since(t0);
+    const uint64_t launches = (rows + k.m - 1) / k.m;
+    for (uint64_t l = 0; l < launches; ++l) {
+        const uint64_t begin = l * k.m;
+        const uint64_t count = std::min(k.m, rows - begin);
+        auto t1 = clock_type::now();
+        parallel_for(count * k.n, g_threads, [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) k.pa[i] = f32_to_bf16(x[begin * k.n + i]);
+        });
+        if (count < k.m) std::memset(k.pa + count * k.n, 0, (k.m - count) * k.n * sizeof(uint16_t));
+        k.bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t2 = clock_type::now();
+        k.run.start();
+        if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+            throw std::runtime_error(k.name + " launch timed out after 60 s");
+        }
+        auto t3 = clock_type::now();
+        k.bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        parallel_for(count * k.n, g_threads, [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) y[begin * k.n + i] = bf16_to_f32(k.pc[i]);
+        });
+        auto t4 = clock_type::now();
+        stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+        stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+        stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+    }
+    stats.calls += 1;
+    stats.launches += launches;
+    stats.elements += rows * k.n;
+}
+
+}  // namespace
+
+void rmsnorm_npu(const float *x, const float *weight, float *y, uint64_t rows, uint64_t N) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        kernel3_t &k = get_kernel3("rmsnorm_n" + std::to_string(N));
+        if (k.n != N || k.b != N) throw std::runtime_error("rmsnorm shape mismatch");
+        run_rows(k, op_stats("rmsnorm"), x, y, rows, weight);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rmsnorm_npu: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_t head_dim) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        kernel3_t &k = get_kernel3("rope_d" + std::to_string(head_dim));
+        if (k.n != head_dim || rows % k.m) {
+            throw std::runtime_error("rope: rows " + std::to_string(rows) + " not a multiple of compiled " +
+                                     std::to_string(k.m) + " (LUT repeats every m rows)");
+        }
+        run_rows(k, op_stats("rope"), x, y, rows, lut);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rope_npu: %s", e.what());
         exit(EXIT_FAILURE);
     }
 }

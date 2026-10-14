@@ -54,4 +54,12 @@ void openfish_linear_npu(
 ) {
     linear_npu(op, in, out, weight, n_rows, in_dim, out_dim);
 }
+
+void openfish_rmsnorm_npu(const float *in, const float *weight, float *out, uint64_t n_rows, uint64_t dim) {
+    rmsnorm_npu(in, weight, out, n_rows, dim);
+}
+
+void openfish_rope_npu(const float *in, const float *lut, float *out, uint64_t n_rows, uint64_t head_dim) {
+    rope_npu(in, lut, out, n_rows, head_dim);
+}
 #endif

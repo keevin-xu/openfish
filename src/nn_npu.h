@@ -17,6 +17,12 @@ int npu_op_enabled(const char *op);
 
 // Linear without bias on the NPU (bf16 GEMM, fp32 result): out[rows, N] = x[rows, K] @ weight[N, K].T.
 // weight is cached on the device by pointer, so it must stay alive and unchanged.
+// RMSNorm rows of N: y = x * rsqrt(mean(x^2) + 1e-5) * weight (residual/alpha folded in by the caller).
+void rmsnorm_npu(const float *x, const float *weight, float *y, uint64_t rows, uint64_t N);
+
+// Half-split RoPE on rows of head_dim; lut holds m rows of [cos(D/2), sin(D/2)] repeated every m rows.
+void rope_npu(const float *x, const float *lut, float *y, uint64_t rows, uint64_t head_dim);
+
 void linear_npu(const char *op, const float *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N);
 
 #ifdef __cplusplus

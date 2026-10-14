@@ -1,0 +1,2 @@
+# rope — provenance
+Copied unmodified from mlir-air `programming_examples/rope_halfsplit/` (md5 .py e5c348aee2d4f08513c934581ff418d2, .cc 75c075a2d3f4fe3c02a986c3a11471d9, Makefile 93b29730b8eefd95f76ae2bcdc0d0b68; identical on server). Half-split RoPE, LUT row = [cos_0..cos_{D/2-1}, sin_0..sin_{D/2-1}]. SUP: head_dim 64, rotary_dim 32 = D/2, q and k rows extracted from the strided qkv tensor on the host side; LUT built from SUP's own sin/cos tables.

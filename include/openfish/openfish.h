@@ -199,6 +199,9 @@ void openfish_linear_npu(
     uint64_t out_dim
 );
 
+void openfish_rmsnorm_npu(const float *in, const float *weight, float *out, uint64_t n_rows, uint64_t dim);
+void openfish_rope_npu(const float *in, const float *lut, float *out, uint64_t n_rows, uint64_t head_dim);
+
 #endif // HAVE_NPU
 
 #ifdef __cplusplus
