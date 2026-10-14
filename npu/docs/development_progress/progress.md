@@ -127,3 +127,10 @@ Combined all-ops run (fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf): Phase 
 
 Combined (all 7 ops on NPU, iGPU base): bfp16 median 0.9886465 (Δ +0.000036), 1516.2 s, 91.1 kJ; native 0.988411
 (Δ −0.0002), 2340.1 s, 111.9 kJ — both PASS; 8.4× / 13× slower than the iGPU alone. **P1 + P2 complete.**
+
+## 2026-10-14 — RMSNorm + RoPE slotted in (no per-op gate); small all-9-op run
+
+`kernels/rmsnorm` (weighted_rms_norm) and `kernels/rope` (rope_halfsplit) added; `rmsnorm_npu`/`rope_npu` in nn_npu.
+50-read run with fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf, rmsnorm, rope on the NPU (iGPU base): 117.3 s vs
+10.2 s iGPU-only; median identity 0.9708615 vs 0.978155 (−0.0073, fails ±0.001). Suspect bf16 residual stream
+through RMSNorm. Needs Phase 1/2 for rmsnorm and rope and an ablation before any further use.
