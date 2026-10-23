@@ -846,9 +846,12 @@ void axpy_npu_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         eltwise_kernel_t &k = get_eltwise("axpy");
-        const double compiled = std::stod(manifest_field(k.json, "alpha"));
-        if (k.inputs != 2 || std::abs(compiled - alpha) > 1e-5 * std::abs(alpha)) {
-            throw std::runtime_error("alpha " + std::to_string(alpha) + " != compiled " + std::to_string(compiled));
+        // the kernel holds alpha as a bf16 constant: the caller's alpha must round to the same bf16 value
+        // (SUP's deepnorm alpha is 2.4494897 in fp32 and 2.449219 in the iGPU's fp16 model; both are bf16 2.453125)
+        const float compiled = std::stof(manifest_field(k.json, "alpha"));
+        if (k.inputs != 2 || f32_to_bf16(compiled) != f32_to_bf16(alpha)) {
+            throw std::runtime_error("alpha " + std::to_string(alpha) + " does not round to the compiled bf16 alpha " +
+                                     std::to_string(compiled));
         }
         run_eltwise(k, op_stats("residual"), x, y, out, n);
     } catch (const std::exception &e) {
