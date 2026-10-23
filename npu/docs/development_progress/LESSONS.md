@@ -43,3 +43,14 @@
 - Load NPU kernels per K×N shape, not per op: 7 ops fit in 6 hw contexts (crf shares fc1's 512×4096 ELF).
 - The CRF linear failed 30.8% of elements at registry tolerance with the bfp16 GEMM yet kept identity within
   0.0001 — the element-wise gate is far stricter than what basecalling needs; report both.
+## 2026-10-23 (direct example ports)
+- air.api elementwise examples carry Python scalars as constants of the tensor dtype: `axpy` with alpha 2.4494897 in
+  bf16 computes with 2.453125. Check scalars against bf16 rounding before calling an example "direct".
+- The llms builders (`rms_gemms_rope_multi`, `o_ffn_multi`) resolve every GEMM through `kernel_registry`
+  (`gemm_registry_config`): an unmeasured shape is a KeyError, and adding it means editing mlir-air. Pick a registry
+  shape for rows per launch instead (SUP: 512×512×512 → drain, tile_m 32).
+- mlir-air's `compile_gemm_mm` comment says the non-BFP16 `mm_aie2p.cc` branch gives wrong results "at these tiles"
+  (SigLIP). At our tiles (64/256/32/128, herd 8×4) the native build passes real-data Phase 1 (R15, and A5 here with
+  mean_rel_L1 ~1e-7): validate per tile config, not per file.
+- bf16_in_fp32_out's mm_aie2p.cc is byte-identical to bf16_in_bf16_out's; the only difference is the module (one
+  launch, f32 C). Its f32 C equals the fused-cast ELF's f32 scratch.

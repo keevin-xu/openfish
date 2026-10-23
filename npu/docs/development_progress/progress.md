@@ -141,3 +141,13 @@ Conv: `CRFModel.cpp` `conv1d_npu` (op `conv`) + 3 new GEMM shapes. 50 reads, con
 iGPU, native −0.0012 (path correct; bfp16 block emulation loses the raw-signal precision). All 10 ops (bfp16):
 116.3 s vs 10.2 s, median −0.024. Fused FFN: upstream `llms/shared/infra/ffn_swiglu/run.py` raises ValueError
 in `_build_gemm_module` (missing method flag) — needs our own multi-launch stitching.
+
+## 2026-10-23 — five direct mlir-air example ports (A5, A7, A8, A2, A6)
+
+New kernels: `kernels/gemm_f32out` (bf16_in_fp32_out), `kernels/axpy`, `kernels/silu`, `kernels/rms_qkv_rope`
+(llms rms_gemms_rope_multi), `kernels/gemm_bfp16w` (bf16_x_bfp16 + `src/npu_bfp16_pack.h`). New ops: `residual`,
+`swish`, `rms_qkv_rope`; `OPENFISH_NPU_GEMM_OUT=f32`; GEMM ELF kinds fused-cast / f32-out / bfp16w by manifest.
+50 reads, iGPU base (median 0.978155): fused norm2 + next wqkv + RoPE Δ 0.0000; axpy residual −0.0012; f32-out native
+GEMMs −0.0012; bfp16w GEMMs −0.0012 except conv (no alignments: truncating packer); swish fails (11/50 align: the
+example's tanh SiLU is biased). Combined, 12 ops (all but swish), native f32-out GEMMs: −0.0018, 120.8 s vs 10.6 s.
+Ledger R21/R22 in `npu-adapting/9-16-npu-adapting-session/results-ledger.md`.
