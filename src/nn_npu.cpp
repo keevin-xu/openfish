@@ -16,6 +16,7 @@
 //                           process in `flock $NPU_LOCK`, that would deadlock.
 
 #include "nn_npu.h"
+#include "npu_bfp16_pack.h"
 
 #include <openfish/openfish_error.h>
 
@@ -179,13 +180,15 @@ struct elementwise_kernel_t {
 // GEMM C[m,n] = A[m,k] @ B[k,n], one of two ELF kinds (manifest "method"):
 //   fused-cast: registry bf16_in_bf16_out GEMM + cast launch, args (A_bf16, B_bf16, C_f32, C_bf16)
 //   f32-out:    bf16_in_fp32_out GEMM, one launch, args (A_bf16, B_bf16, C_f32); no bf16 output exists
+//   bfp16w:     bf16_x_bfp16 GEMM, one launch, args (A_bf16, B_bfp16ebs8 packed, C_bf16); no f32 output exists
 // The f32 C is read back for an f32 result (full-precision accumulator, no bf16 round trip).
-// B = weight.T is converted to bf16 once per weight tensor and kept resident.
+// B = weight.T is converted (bf16, or bf16 then bfp16ebs8-packed) once per weight tensor and kept resident.
 struct gemm_kernel_t {
     std::string name;
     std::string path;
     std::string method;
     uint64_t m = 0, k = 0, n = 0;
+    uint64_t tile_n = 0, tile_k_l1 = 0;  // bfp16w weight packing
     xrt::device device;
     xrt::elf elf;
     xrt::hw_context ctx;
@@ -210,11 +213,19 @@ struct gemm_kernel_t {
           ctx(device, elf),
           kernel(ctx, manifest_field(json, "kernel_name")),
           bo_a(xrt::ext::bo(device, m * k * sizeof(uint16_t))),
-          bo_c32(xrt::ext::bo(device, m * n * sizeof(float))),
           a(bo_a.map<uint16_t *>()),
-          c32(bo_c32.map<float *>()),
           run(kernel) {
         run.set_arg(0, bo_a);
+        if (method == "bfp16w") {
+            tile_n = std::stoull(manifest_field(json, "tile_n"));
+            tile_k_l1 = std::stoull(manifest_field(json, "tile_k_l1"));
+            bo_c16 = xrt::ext::bo(device, m * n * sizeof(uint16_t));
+            c16 = bo_c16.map<uint16_t *>();
+            run.set_arg(2, bo_c16);
+            return;
+        }
+        bo_c32 = xrt::ext::bo(device, m * n * sizeof(float));
+        c32 = bo_c32.map<float *>();
         run.set_arg(2, bo_c32);
         if (method == "fused-cast") {
             bo_c16 = xrt::ext::bo(device, m * n * sizeof(uint16_t));
@@ -319,8 +330,8 @@ gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
     const std::string manifest = std::string(dir) + "/gemm_k" + std::to_string(K) + "_n" + std::to_string(N) + ".json";
     const std::string json = read_file(manifest);
     const std::string method = manifest_field(json, "method");
-    if (manifest_field(json, "format") != "elf" || (method != "fused-cast" && method != "f32-out")) {
-        throw std::runtime_error(manifest + ": expected format elf, method fused-cast or f32-out");
+    if (manifest_field(json, "format") != "elf" || (method != "fused-cast" && method != "f32-out" && method != "bfp16w")) {
+        throw std::runtime_error(manifest + ": expected format elf, method fused-cast, f32-out or bfp16w");
     }
     init_common();
     auto t0 = clock_type::now();
@@ -452,6 +463,21 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
 
         auto t0 = clock_type::now();
         auto w = g.weights.find(weight);
+        if (w == g.weights.end() && g.method == "bfp16w") {
+            // B[k, n] = weight[n, k].T rounded to bf16, then bfp16ebs8-packed (example pack_b_bfp16ebs8), resident
+            std::vector<float> wr(K * N);
+            parallel_for(K * N, g_threads, [&](uint64_t lo, uint64_t hi) {
+                for (uint64_t i = lo; i < hi; ++i) wr[i] = bf16_to_f32(f32_to_bf16(weight[i]));
+            });
+            const uint64_t nb = N / g.tile_n;
+            xrt::bo bo_b = xrt::ext::bo(g.device, nb * (K / g.tile_k_l1) * npu_bfp16::tile_bytes(g.tile_n, g.tile_k_l1));
+            uint8_t *b = bo_b.map<uint8_t *>();
+            parallel_for(nb, std::min<int>(g_threads, (int)nb), [&](uint64_t lo, uint64_t hi) {
+                npu_bfp16::pack_weight(wr.data(), N, K, g.tile_n, g.tile_k_l1, b, lo, hi);
+            });
+            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            w = g.weights.emplace(weight, bo_b).first;
+        }
         if (w == g.weights.end()) {
             // B[k, n] = weight[n, k].T, bf16, resident for the process lifetime
             xrt::bo bo_b = xrt::ext::bo(g.device, K * N * sizeof(uint16_t));
@@ -494,6 +520,10 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
             auto t3 = clock_type::now();
 
             if constexpr (std::is_same<Out, float>::value) {
+                if (!g.c32) {
+                    throw std::runtime_error(std::string(op) + ": f32 output requested but the GEMM ELF is bfp16w "
+                                             "(bf16 output only; unset OPENFISH_NPU_GEMM_OUT)");
+                }
                 g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // fp32 accumulator
                 parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
                     std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
