@@ -11,6 +11,9 @@
 
 Later kernels (only after silu_mul reaches Phase 3): rmsnorm, rotary_emb, gemm_fc1, gemm_fc2, gemm_wqkv, gemm_oproj, lstm_layer.
 
+## Porting targets
+Ordered list (mlir-air example ports vs hand-coded extras): `docs/porting_targets.md`.
+
 ## Active blockers
 (none)
 
