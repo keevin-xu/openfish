@@ -44,7 +44,6 @@ wqkv, out_proj, upsample, crf, rmsnorm, rope, conv (im2col + GEMM).
 | C4 | **HAND-CODED EXTRA** | Per-op GEMM build selection (native for conv, bfp16 elsewhere) | conv identity −0.019 (bfp16) vs −0.0012 (native) | not started |
 | C5 | **HAND-CODED EXTRA** | Move remaining host packing (im2col, padding, silu split) into iGPU kernels | part of the 18.45 s host time | not started |
 | C6 | **HAND-CODED EXTRA** | Individual identity gates for RMSNorm and RoPE | both slotted in without gates; all-10 run fails identity | not started |
-
 | C7 | **HAND-CODED EXTRA** | Round-to-nearest bfp16ebs8 weight packer (the example's truncates) so `gemm_bfp16w` works for conv | A6 conv: no alignments; −1…−1.6% weight-sum shift | not started |
 | C8 | **HAND-CODED EXTRA** | Accurate bf16 SiLU for the conv stack (the example's tanh form flushes x < −6 to 0, ~10% bias on [−5, −2]) | A8: 11/50 reads align | not started |
 
