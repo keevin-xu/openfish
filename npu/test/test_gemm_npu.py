@@ -26,7 +26,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 HERE = Path(__file__).resolve().parent
-KDIR = HERE.parent / "kernels" / "gemm_bf16"
+KDIR = HERE.parent / "kernels" / ("gemm_f32out" if "f32out" in sys.argv else "gemm_bf16")
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(KDIR))
 import reference as ref  # noqa: E402
@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--mmul", choices=["bfp16", "native"], default="bfp16",
                     help="bfp16: registry build (AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16, 8-elem shared-exponent "
                          "8-bit-mantissa blocks); native: same mm_aie2p.cc without that define")
+    ap.add_argument("--kernel", choices=["bf16out", "f32out"], default="bf16out",
+                    help="bf16out: kernels/gemm_bf16 (fused-cast / drain); f32out: kernels/gemm_f32out "
+                         "(mlir-air bf16_in_fp32_out, one launch, f32 C, gated against the fp32 product)")
     args = ap.parse_args()
     d = Path(args.dump_dir or "")
     if not (d / "manifest.tsv").exists():
@@ -97,8 +100,8 @@ def main():
         src, wl, bl, el = specs[name]
         a32, w, bias, cpu_out = rows(src(), M), wl(), bl(), rows(el(), M)
         K, N = a32.shape[1], w.shape[0]
-        method = "fused-cast" if M * K * N >= 4e9 else "drain"
-        tile_m = 64 if method == "fused-cast" else 32
+        method = "f32-out" if args.kernel == "f32out" else ("fused-cast" if M * K * N >= 4e9 else "drain")
+        tile_m = 64 if method != "drain" else 32
         for c in (M % (tile_m * 8), K % 256, N % 512):
             assert c == 0, f"{name}: illegal tiling {M}x{K}x{N}"
         mk = subprocess.run(["make", "-s", "-n", "-C", str(KDIR), "compile-kernel", f"TILE_M={tile_m}"],
@@ -108,7 +111,12 @@ def main():
             mk = mk.replace("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16", "")
         subprocess.run(mk, shell=True, check=True, cwd=KDIR, executable="/bin/bash")
         os.chdir(KDIR / "build_peano")
-        if method == "fused-cast":
+        if method == "f32-out":
+            module = gemm.build_module(M, K, N, tile_m, TILES["tile_k_l2"], TILES["tile_k_l1"], TILES["tile_n"],
+                                       TILES["herd_m"], TILES["herd_n"], bfloat16, np.float32, arch="aie2p",
+                                       emit_external_call=True)
+            fmt, inst = "elf", "matmul_bf16"
+        elif method == "fused-cast":
             module = gemm.build_module_gemm_cast(M, K, N, tile_m, **TILES, arch="aie2p")
             fmt, inst = "elf", "gemm_cast_bf16"
         else:
@@ -122,11 +130,13 @@ def main():
 
         a_bf = a32.astype(bfloat16)
         b_bf = np.ascontiguousarray(w.T).astype(bfloat16)
-        expected = (a_bf.astype(np.float32) @ b_bf.astype(np.float32)).astype(bfloat16)
+        expected = (a_bf.astype(np.float32) @ b_bf.astype(np.float32))
+        if method != "f32-out":
+            expected = expected.astype(bfloat16)
         inputs = [a_bf, b_bf] + ([np.zeros((M, N), np.float32)] if method == "fused-cast" else [])
         invoke = backend.load(artifact)
         try:
-            res = invoke(*inputs, np.zeros((M, N), bfloat16))
+            res = invoke(*inputs, np.zeros((M, N), np.float32 if method == "f32-out" else bfloat16))
             out = res[len(inputs)].reshape(M, N)
             f32_out = res[2].reshape(M, N) if method == "fused-cast" else None
         finally:
@@ -154,6 +164,7 @@ def main():
                  dump_nfail=n_fail(o32, cpu_out), floor_mrl1=ref.compare(floor, cpu_out)["mean_rel_L1"],
                  npu_ms=lat_ms, cpu_ms=cpu_ms)
         r["mmul"] = args.mmul
+        r["kernel"] = args.kernel
         results.append(r)
         if f32_out is not None:
             e32 = a_bf.astype(np.float32) @ b_bf.astype(np.float32)
@@ -166,6 +177,7 @@ def main():
         print(f"perf: NPU kernel-only mean {lat_ms:.2f} ms ({args.perf_iters} iters) vs torch fp32 8 thr median {cpu_ms:.2f} ms "
               f"-> {cpu_ms / lat_ms:.1f}x")
 
+    print(f"\nkernel {args.kernel}, mmul {args.mmul}")
     print("\n| op | M×K×N | method | gate | n outside tol | mean_rel_L1 | vs dump mean_rel_L1 | vs dump cosine | NPU ms | CPU 8thr ms | speedup |")
     print("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in results:

@@ -76,4 +76,18 @@ void openfish_rmsnorm_npu_bf16(const uint16_t *in, const float *weight, uint16_t
 void openfish_rope_npu_bf16(const uint16_t *in, const float *lut, uint16_t *out, uint64_t n_rows, uint64_t head_dim) {
     rope_npu_bf16(in, lut, out, n_rows, head_dim);
 }
+void openfish_linear_npu_bf16_f32(const char *op, const uint16_t *in, float *out, const float *weight, uint64_t n_rows,
+                                  uint64_t in_dim, uint64_t out_dim) {
+    linear_npu_bf16_f32(op, in, out, weight, n_rows, in_dim, out_dim);
+}
+void openfish_axpy_npu_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *out, uint64_t n) {
+    axpy_npu_bf16(alpha, x, y, out, n);
+}
+void openfish_silu_npu_bf16(const uint16_t *in, uint16_t *out, uint64_t n) {
+    silu_npu_bf16(in, out, n);
+}
+void openfish_rms_qkv_rope_npu_bf16(const uint16_t *in, const float *norm_weight, const float *wqkv_weight, const float *lut,
+                                    uint16_t *normed, uint16_t *qkv, uint64_t n_rows, uint64_t seq_len) {
+    rms_qkv_rope_npu_bf16(in, norm_weight, wqkv_weight, lut, normed, qkv, n_rows, seq_len);
+}
 #endif

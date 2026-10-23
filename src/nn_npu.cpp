@@ -5,7 +5,8 @@
 //
 // Environment:
 //   OPENFISH_NPU_OPS        comma list of ops to run on the NPU (default: none);
-//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf, rmsnorm, rope, conv
+//                           known: silu_mul, fc1, fc2, wqkv, out_proj, upsample, crf, rmsnorm, rope, conv,
+//                           residual (axpy), swish (silu), rms_qkv_rope (fused norm2 + next layer's wqkv + RoPE)
 //                           (GEMM ops share one loaded ELF per K x N shape, e.g. fc1 and crf)
 //   OPENFISH_NPU_ARTIFACTS  directory with silu_mul.json + its ELF
 //   OPENFISH_NPU_GEMM_ARTIFACTS  directory with gemm_k<K>_n<N>.json + ELFs (fc1/fc2)
@@ -31,6 +32,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -174,12 +176,15 @@ struct elementwise_kernel_t {
     }
 };
 
-// GEMM C[m,n] = A[m,k] @ B[k,n] from the registry fused-cast ELF (args A_bf16, B_bf16, C_f32, C_bf16).
-// The f32 scratch C is read back as the result (full-precision accumulator, no bf16 round trip).
+// GEMM C[m,n] = A[m,k] @ B[k,n], one of two ELF kinds (manifest "method"):
+//   fused-cast: registry bf16_in_bf16_out GEMM + cast launch, args (A_bf16, B_bf16, C_f32, C_bf16)
+//   f32-out:    bf16_in_fp32_out GEMM, one launch, args (A_bf16, B_bf16, C_f32); no bf16 output exists
+// The f32 C is read back for an f32 result (full-precision accumulator, no bf16 round trip).
 // B = weight.T is converted to bf16 once per weight tensor and kept resident.
 struct gemm_kernel_t {
     std::string name;
     std::string path;
+    std::string method;
     uint64_t m = 0, k = 0, n = 0;
     xrt::device device;
     xrt::elf elf;
@@ -196,6 +201,7 @@ struct gemm_kernel_t {
     gemm_kernel_t(const std::string &op, const std::string &dir, const std::string &json)
         : name(op),
           path(dir + "/" + manifest_field(json, "file")),
+          method(manifest_field(json, "method")),
           m(std::stoull(manifest_field(json, "m"))),
           k(std::stoull(manifest_field(json, "k"))),
           n(std::stoull(manifest_field(json, "n"))),
@@ -205,14 +211,16 @@ struct gemm_kernel_t {
           kernel(ctx, manifest_field(json, "kernel_name")),
           bo_a(xrt::ext::bo(device, m * k * sizeof(uint16_t))),
           bo_c32(xrt::ext::bo(device, m * n * sizeof(float))),
-          bo_c16(xrt::ext::bo(device, m * n * sizeof(uint16_t))),
           a(bo_a.map<uint16_t *>()),
           c32(bo_c32.map<float *>()),
-          c16(bo_c16.map<uint16_t *>()),
           run(kernel) {
         run.set_arg(0, bo_a);
         run.set_arg(2, bo_c32);
-        run.set_arg(3, bo_c16);
+        if (method == "fused-cast") {
+            bo_c16 = xrt::ext::bo(device, m * n * sizeof(uint16_t));
+            c16 = bo_c16.map<uint16_t *>();
+            run.set_arg(3, bo_c16);
+        }
     }
 };
 
@@ -310,8 +318,9 @@ gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
     }
     const std::string manifest = std::string(dir) + "/gemm_k" + std::to_string(K) + "_n" + std::to_string(N) + ".json";
     const std::string json = read_file(manifest);
-    if (manifest_field(json, "format") != "elf" || manifest_field(json, "method") != "fused-cast") {
-        throw std::runtime_error(manifest + ": expected format elf, method fused-cast");
+    const std::string method = manifest_field(json, "method");
+    if (manifest_field(json, "format") != "elf" || (method != "fused-cast" && method != "f32-out")) {
+        throw std::runtime_error(manifest + ": expected format elf, method fused-cast or f32-out");
     }
     init_common();
     auto t0 = clock_type::now();
@@ -320,8 +329,8 @@ gemm_kernel_t *load_gemm(const std::string &op, uint64_t K, uint64_t N) {
         throw std::runtime_error(manifest + ": shape mismatch");
     }
     fprintf(stderr,
-            "[nn_npu] loaded gemm %lux%lu for %s: %s (sha256 %s), kernel %s, M=%lu, mmul %s, tiles m/kl2/kl1/n %s/%s/%s/%s herd %s, %.3f s\n",
-            (unsigned long)K, (unsigned long)N, op.c_str(), g->path.c_str(), manifest_field(json, "sha256").c_str(),
+            "[nn_npu] loaded gemm %lux%lu for %s: %s (%s, sha256 %s), kernel %s, M=%lu, mmul %s, tiles m/kl2/kl1/n %s/%s/%s/%s herd %s, %.3f s\n",
+            (unsigned long)K, (unsigned long)N, op.c_str(), g->path.c_str(), method.c_str(), manifest_field(json, "sha256").c_str(),
             manifest_field(json, "kernel_name").c_str(), (unsigned long)g->m, manifest_field(json, "mmul").c_str(),
             manifest_field(json, "tile_m").c_str(), manifest_field(json, "tile_k_l2").c_str(),
             manifest_field(json, "tile_k_l1").c_str(), manifest_field(json, "tile_n").c_str(),
@@ -490,6 +499,10 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
                     std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
                 });
             } else {
+                if (!g.c16) {
+                    throw std::runtime_error(std::string(op) + ": bf16 output requested but the GEMM ELF is f32-out "
+                                             "(set OPENFISH_NPU_GEMM_OUT=f32)");
+                }
                 g.bo_c16.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // bf16 output of the cast launch
                 parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
                     std::memcpy(out + begin * N + lo, g.c16 + lo, (hi - lo) * sizeof(uint16_t));
@@ -652,6 +665,273 @@ static void rope_impl(const T *x, const float *lut, T *y, uint64_t rows, uint64_
     }
 }
 
+// ---- generic 1-D bf16 elementwise kernels (air.api examples: axpy = (x, y, out), silu = (x, out)), manifest
+// <name>.json in OPENFISH_NPU_ARTIFACTS with n elements per launch and the number of inputs.
+namespace {
+
+struct eltwise_kernel_t {
+    std::string name, json;
+    uint64_t n = 0;
+    int inputs = 0;
+    xrt::device device;
+    xrt::elf elf;
+    xrt::hw_context ctx;
+    xrt::ext::kernel kernel;
+    xrt::bo bo_in[2], bo_out;
+    uint16_t *in[2] = {nullptr, nullptr}, *out = nullptr;
+    xrt::run run;
+
+    eltwise_kernel_t(const std::string &nm, const std::string &dir, const std::string &js)
+        : name(nm),
+          json(js),
+          n(std::stoull(manifest_field(js, "n"))),
+          inputs(std::stoi(manifest_field(js, "inputs"))),
+          device(0),
+          elf(dir + "/" + manifest_field(js, "file")),
+          ctx(device, elf),
+          kernel(ctx, manifest_field(js, "kernel_name")),
+          run(kernel) {
+        if (inputs < 1 || inputs > 2) throw std::runtime_error(nm + ": manifest inputs must be 1 or 2");
+        for (int i = 0; i < inputs; ++i) {
+            bo_in[i] = xrt::ext::bo(device, n * sizeof(uint16_t));
+            in[i] = bo_in[i].map<uint16_t *>();
+            run.set_arg(i, bo_in[i]);
+        }
+        bo_out = xrt::ext::bo(device, n * sizeof(uint16_t));
+        out = bo_out.map<uint16_t *>();
+        run.set_arg(inputs, bo_out);
+    }
+};
+
+std::unordered_map<std::string, eltwise_kernel_t *> g_ew;
+
+eltwise_kernel_t &get_eltwise(const std::string &name) {
+    auto it = g_ew.find(name);
+    if (it != g_ew.end()) {
+        return *it->second;
+    }
+    const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
+    if (!dir) {
+        throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
+    }
+    const std::string json = read_file(std::string(dir) + "/" + name + ".json");
+    init_common();
+    auto *k = new eltwise_kernel_t(name, dir, json);
+    fprintf(stderr, "[nn_npu] loaded %s: %s/%s (sha256 %s), kernel %s, n=%lu, inputs %d\n", name.c_str(), dir,
+            manifest_field(json, "file").c_str(), manifest_field(json, "sha256").c_str(),
+            manifest_field(json, "kernel_name").c_str(), (unsigned long)k->n, k->inputs);
+    return *g_ew.emplace(name, k).first->second;
+}
+
+// out[i] = f(a[i][, b[i]]) over total elements, n per launch, the last launch zero-padded.
+void run_eltwise(eltwise_kernel_t &k, npu_stats_t &stats, const uint16_t *a, const uint16_t *b, uint16_t *o, uint64_t total) {
+    const uint16_t *src[2] = {a, b};
+    const uint64_t launches = (total + k.n - 1) / k.n;
+    for (uint64_t l = 0; l < launches; ++l) {
+        const uint64_t begin = l * k.n;
+        const uint64_t count = std::min(k.n, total - begin);
+        auto t0 = clock_type::now();
+        for (int i = 0; i < k.inputs; ++i) {
+            parallel_for(count, g_threads, [&](uint64_t lo, uint64_t hi) {
+                std::memcpy(k.in[i] + lo, src[i] + begin + lo, (hi - lo) * sizeof(uint16_t));
+            });
+            if (count < k.n) std::memset(k.in[i] + count, 0, (k.n - count) * sizeof(uint16_t));
+            k.bo_in[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        auto t1 = clock_type::now();
+        k.run.start();
+        if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+            throw std::runtime_error(k.name + " launch timed out after 60 s");
+        }
+        auto t2 = clock_type::now();
+        k.bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        parallel_for(count, g_threads, [&](uint64_t lo, uint64_t hi) {
+            std::memcpy(o + begin + lo, k.out + lo, (hi - lo) * sizeof(uint16_t));
+        });
+        auto t3 = clock_type::now();
+        stats.t_in += std::chrono::duration<double>(t1 - t0).count();
+        stats.t_kernel += std::chrono::duration<double>(t2 - t1).count();
+        stats.t_out += std::chrono::duration<double>(t3 - t2).count();
+    }
+    stats.calls += 1;
+    stats.launches += launches;
+    stats.elements += total;
+}
+
+// ---- fused RMSNorm -> Q/K/V GEMMs -> RoPE(Q, K) (mlir-air llms rms_gemms_rope_multi, 13 args, m rows per launch):
+//   0 x_in[m,d] 1 norm_w[d] 2 normed[m,d] 3 wq[d,d] 4 q 5 wk[d,d] 6 k 7 wv[d,d] 8 v 9 lut_q[m*d] 10 lut_k 11 q_roped 12 k_roped
+// Weights (B = W.T per q/k/v slice of wqkv) and the norm weight are bf16-resident per host pointer; the LUT rows
+// for positions t0..t0+m-1 are one buffer per t0 (rows of a launch never straddle a chunk: T % m == 0).
+struct rqr_kernel_t {
+    uint64_t m = 0, d = 0, heads = 0, hd = 0;
+    xrt::device device;
+    xrt::elf elf;
+    xrt::hw_context ctx;
+    xrt::ext::kernel kernel;
+    xrt::bo bo[13];
+    uint16_t *p[13] = {};
+    xrt::run run;
+    std::unordered_map<const float *, std::vector<xrt::bo>> wqkv;
+    std::unordered_map<const float *, xrt::bo> normw;
+    const float *lut_key = nullptr;
+    uint64_t lut_T = 0;
+    std::vector<xrt::bo> luts;
+
+    rqr_kernel_t(const std::string &dir, const std::string &json)
+        : m(std::stoull(manifest_field(json, "m"))),
+          d(std::stoull(manifest_field(json, "n"))),
+          heads(std::stoull(manifest_field(json, "heads"))),
+          hd(std::stoull(manifest_field(json, "head_dim"))),
+          device(0),
+          elf(dir + "/" + manifest_field(json, "file")),
+          ctx(device, elf),
+          kernel(ctx, manifest_field(json, "kernel_name")),
+          run(kernel) {
+        if (std::stoi(manifest_field(json, "nargs")) != 13 || heads * hd != d) {
+            throw std::runtime_error("rms_qkv_rope manifest: expected 13 args and heads*head_dim == n");
+        }
+        for (int i : {0, 2, 4, 6, 8, 11, 12}) {
+            bo[i] = xrt::ext::bo(device, m * d * sizeof(uint16_t));
+            p[i] = bo[i].map<uint16_t *>();
+            run.set_arg(i, bo[i]);
+        }
+    }
+};
+
+rqr_kernel_t *g_rqr = nullptr;
+
+xrt::bo bf16_bo(xrt::device &dev, uint64_t n, const std::function<float(uint64_t)> &val) {
+    xrt::bo b = xrt::ext::bo(dev, n * sizeof(uint16_t));
+    uint16_t *ptr = b.map<uint16_t *>();
+    parallel_for(n, g_threads, [&](uint64_t lo, uint64_t hi) {
+        for (uint64_t i = lo; i < hi; ++i) ptr[i] = f32_to_bf16(val(i));
+    });
+    b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return b;
+}
+
+}  // namespace
+
+void axpy_npu_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *out, uint64_t n) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        eltwise_kernel_t &k = get_eltwise("axpy");
+        const double compiled = std::stod(manifest_field(k.json, "alpha"));
+        if (k.inputs != 2 || std::abs(compiled - alpha) > 1e-5 * std::abs(alpha)) {
+            throw std::runtime_error("alpha " + std::to_string(alpha) + " != compiled " + std::to_string(compiled));
+        }
+        run_eltwise(k, op_stats("residual"), x, y, out, n);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("axpy_npu: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void silu_npu_bf16(const uint16_t *x, uint16_t *out, uint64_t n) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        eltwise_kernel_t &k = get_eltwise("silu");
+        if (k.inputs != 1) throw std::runtime_error("silu manifest: expected 1 input");
+        run_eltwise(k, op_stats("swish"), x, nullptr, out, n);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("silu_npu: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *wqkv, const float *lut, uint16_t *normed,
+                           uint16_t *qkv, uint64_t rows, uint64_t T) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        if (!g_rqr) {
+            const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
+            if (!dir) throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
+            const std::string json = read_file(std::string(dir) + "/rms_qkv_rope.json");
+            init_common();
+            g_rqr = new rqr_kernel_t(dir, json);
+            fprintf(stderr, "[nn_npu] loaded rms_qkv_rope: %s/%s (sha256 %s), kernel %s, m=%lu d=%lu heads=%lu, gemm %s\n", dir,
+                    manifest_field(json, "file").c_str(), manifest_field(json, "sha256").c_str(),
+                    manifest_field(json, "kernel_name").c_str(), (unsigned long)g_rqr->m, (unsigned long)g_rqr->d,
+                    (unsigned long)g_rqr->heads, manifest_field(json, "gemm_method").c_str());
+        }
+        rqr_kernel_t &k = *g_rqr;
+        npu_stats_t &stats = op_stats("rms_qkv_rope");
+        const uint64_t m = k.m, d = k.d;
+        if (T % m || rows % T) {
+            throw std::runtime_error("T " + std::to_string(T) + " must be a multiple of the compiled rows " +
+                                     std::to_string(m) + " and rows a multiple of T");
+        }
+        auto t0 = clock_type::now();
+        if (k.lut_key != lut || k.lut_T != T) {
+            k.luts.clear();
+            const uint64_t per = m * d;  // m positions x heads rows x head_dim
+            for (uint64_t t = 0; t < T; t += m) {
+                const float *src = lut + t * d;
+                k.luts.push_back(bf16_bo(k.device, per, [&](uint64_t i) { return src[i]; }));
+            }
+            k.lut_key = lut;
+            k.lut_T = T;
+        }
+        auto nw = k.normw.find(norm_w);
+        if (nw == k.normw.end()) {
+            nw = k.normw.emplace(norm_w, bf16_bo(k.device, d, [&](uint64_t i) { return norm_w[i]; })).first;
+        }
+        auto w = k.wqkv.find(wqkv);
+        if (w == k.wqkv.end()) {
+            std::vector<xrt::bo> v;
+            for (uint64_t sl = 0; sl < 3; ++sl) {  // B[e, j] = W[sl*d + j, e]
+                const float *ws = wqkv + sl * d * d;
+                v.push_back(bf16_bo(k.device, d * d, [&](uint64_t i) { return ws[(i % d) * d + i / d]; }));
+            }
+            w = k.wqkv.emplace(wqkv, std::move(v)).first;
+        }
+        k.run.set_arg(1, nw->second);
+        k.run.set_arg(3, w->second[0]);
+        k.run.set_arg(5, w->second[1]);
+        k.run.set_arg(7, w->second[2]);
+        stats.t_in += seconds_since(t0);
+
+        const uint64_t launches = rows / m;
+        for (uint64_t l = 0; l < launches; ++l) {
+            const uint64_t begin = l * m;
+            auto t1 = clock_type::now();
+            const xrt::bo &lb = k.luts[(begin % T) / m];
+            k.run.set_arg(9, lb);
+            k.run.set_arg(10, lb);
+            parallel_for(m * d, g_threads, [&](uint64_t lo, uint64_t hi) {
+                std::memcpy(k.p[0] + lo, x + begin * d + lo, (hi - lo) * sizeof(uint16_t));
+            });
+            k.bo[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto t2 = clock_type::now();
+            k.run.start();
+            if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+                throw std::runtime_error("rms_qkv_rope launch timed out after 60 s");
+            }
+            auto t3 = clock_type::now();
+            for (int i : {2, 11, 12, 8}) k.bo[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            parallel_for(m, g_threads, [&](uint64_t lo, uint64_t hi) {
+                for (uint64_t r = lo; r < hi; ++r) {
+                    const uint64_t row = begin + r;
+                    std::memcpy(normed + row * d, k.p[2] + r * d, d * sizeof(uint16_t));
+                    std::memcpy(qkv + row * 3 * d, k.p[11] + r * d, d * sizeof(uint16_t));
+                    std::memcpy(qkv + row * 3 * d + d, k.p[12] + r * d, d * sizeof(uint16_t));
+                    std::memcpy(qkv + row * 3 * d + 2 * d, k.p[8] + r * d, d * sizeof(uint16_t));
+                }
+            });
+            auto t4 = clock_type::now();
+            stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+            stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+            stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+        }
+        stats.calls += 1;
+        stats.launches += launches;
+        stats.elements += rows * d;
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rms_qkv_rope_npu: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
 // float32 host I/O (CPU build) and bf16 host I/O (iGPU build: tensors cast fp16 -> bf16 on the GPU)
 void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
 void silu_mul_npu_bf16(const uint16_t *x, uint16_t *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
@@ -659,6 +939,9 @@ void linear_npu(const char *op, const float *x, float *out, const float *w, uint
     linear_impl(op, x, out, w, rows, K, N);
 }
 void linear_npu_bf16(const char *op, const uint16_t *x, uint16_t *out, const float *w, uint64_t rows, uint64_t K, uint64_t N) {
+    linear_impl(op, x, out, w, rows, K, N);
+}
+void linear_npu_bf16_f32(const char *op, const uint16_t *x, float *out, const float *w, uint64_t rows, uint64_t K, uint64_t N) {
     linear_impl(op, x, out, w, rows, K, N);
 }
 void rmsnorm_npu(const float *x, const float *w, float *y, uint64_t rows, uint64_t N) { rmsnorm_impl(x, w, y, rows, N); }

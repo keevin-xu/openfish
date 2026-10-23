@@ -6,12 +6,14 @@ import shutil
 from pathlib import Path
 
 
-def compile_elf(module, name, out_dir, fields):
+def compile_elf(module, name, out_dir, fields, **backend_kwargs):
+    """backend_kwargs override the XRTBackend defaults (e.g. the example's runtime_loop_tiling_sizes)."""
     from air.backend.xrt import XRTBackend
 
     funcs = [f for f in re.findall(r"func\.func @(\w+)\(", str(module))]
-    backend = XRTBackend(target_device="npu2", omit_while_true_loop=False, output_format="elf",
-                         instance_name=funcs[0])
+    kw = dict(target_device="npu2", omit_while_true_loop=False, output_format="elf", instance_name=funcs[0])
+    kw.update(backend_kwargs)
+    backend = XRTBackend(**kw)
     artifact = backend.compile(module)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

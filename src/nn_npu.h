@@ -30,6 +30,16 @@ void silu_mul_npu_bf16(const uint16_t *x, uint16_t *o, uint64_t MN, uint64_t K);
 void linear_npu_bf16(const char *op, const uint16_t *x, uint16_t *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N);
 void rmsnorm_npu_bf16(const uint16_t *x, const float *weight, uint16_t *y, uint64_t rows, uint64_t N);
 void rope_npu_bf16(const uint16_t *x, const float *lut, uint16_t *y, uint64_t rows, uint64_t head_dim);
+// bf16 in, f32 out (fp32 accumulator; with an f32-out GEMM ELF this is the only valid output)
+void linear_npu_bf16_f32(const char *op, const uint16_t *x, float *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N);
+// out = alpha * x + y (mlir-air axpy; alpha is compiled into the ELF and checked)
+void axpy_npu_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *out, uint64_t n);
+// out = x * sigmoid(x) (mlir-air silu)
+void silu_npu_bf16(const uint16_t *x, uint16_t *out, uint64_t n);
+// normed = RMSNorm(x) * norm_w; qkv[rows, 3, d] = normed @ wqkv[3d, d].T with RoPE on the q and k thirds
+// (mlir-air rms_gemms_rope_multi); lut[T * heads, head_dim] rows of [cos | sin] for (position, head); rows = N * T
+void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *wqkv, const float *lut, uint16_t *normed,
+                           uint16_t *qkv, uint64_t rows, uint64_t T);
 
 #ifdef __cplusplus
 }
