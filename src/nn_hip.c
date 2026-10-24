@@ -7,6 +7,8 @@
 #include <openfish/openfish_error.h>
 
 #include <hip/hip_runtime.h>
+#include <stdlib.h>
+#include <string.h>
 #include <hip/hip_fp16.h>
 
 void openfish_rmsnorm_quant_int8_gpu(
@@ -192,11 +194,23 @@ void openfish_rotary_emb_gpu(
 
 // ---- zero-copy iGPU <-> NPU buffers (nn_hip_shared.h; used by nn_npu.cpp)
 
+// Uncached by default: the NPU's writes do not invalidate the iGPU's caches, so an iGPU read of a cached line after an
+// NPU write returns stale data (seen with the 512 KiB rms_qkv_rope outputs). OPENFISH_NPU_ZC_ALLOC=cached uses plain
+// hipMalloc, =finegrained hipDeviceMallocFinegrained (for comparison).
 int hip_shared_alloc(uint64_t bytes, void **dptr, int *dmabuf_fd) {
     const uint64_t size = (bytes + 4095) / 4096 * 4096;
-    hipError_t ret = hipMalloc(dptr, size);
+    const char *mode = getenv("OPENFISH_NPU_ZC_ALLOC");
+    hipError_t ret;
+    if (mode && strcmp(mode, "cached") == 0) {
+        ret = hipMalloc(dptr, size);
+    } else if (mode && strcmp(mode, "finegrained") == 0) {
+        ret = hipExtMallocWithFlags(dptr, size, hipDeviceMallocFinegrained);
+    } else {
+        ret = hipExtMallocWithFlags(dptr, size, hipDeviceMallocUncached);
+    }
     if (ret != hipSuccess) {
-        fprintf(stderr, "hip_shared_alloc: hipMalloc(%lu): %s\n", (unsigned long)size, hipGetErrorString(ret));
+        fprintf(stderr, "hip_shared_alloc: allocation of %lu bytes (%s): %s\n", (unsigned long)size, mode ? mode : "uncached",
+                hipGetErrorString(ret));
         *dptr = NULL;
         return -1;
     }
