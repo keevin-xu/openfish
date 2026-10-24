@@ -279,8 +279,10 @@ int main(int argc, char **argv) {
         xrt::bo bx = xrt::ext::bo(dev, bytes), by = xrt::ext::bo(dev, bytes), bo = xrt::ext::bo(dev, bytes);
         auto *mx = bx.map<uint16_t *>(), *my = by.map<uint16_t *>(), *mo = bo.map<uint16_t *>();
         const char *variants[] = {"plain", "delay", "resync"};
+        constexpr uint64_t kTail = 4096;
+        std::vector<uint16_t> tail(kTail);
         for (int v = 0; v < 3; ++v) {
-            int failed = 0;
+            int failed = 0, host_failed = 0;
             uint64_t bad_total = 0;
             std::string first;
             double move = 0, kern = 0;
@@ -307,6 +309,7 @@ int main(int argc, char **argv) {
                     bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 }
                 std::memcpy(hout.data(), mo, bytes);
+                std::memcpy(tail.data(), hout.data() + (n - kTail), kTail * sizeof(uint16_t));  // what the CPU read
                 HIP_OK(hipMemcpy(dout, hout.data(), bytes, hipMemcpyHostToDevice));
                 const double out = ms_since(t2);
                 if (v == 0 && it > 0) {  // the first iteration warms up; only the plain path is timed
@@ -315,14 +318,26 @@ int main(int argc, char **argv) {
                 }
                 HIP_OK(hipMemcpy(host.data(), dout, bytes, hipMemcpyDeviceToHost));
                 const check_t c = check(host, n, seed, alpha16);
+                // locate the stale values: already wrong in the NPU buffer the CPU read, or only after hipMemcpy H2D
+                std::vector<uint16_t> tail_full(n, 0);
+                std::memcpy(tail_full.data() + (n - kTail), tail.data(), kTail * sizeof(uint16_t));
+                uint64_t tail_bad = 0;
+                for (uint64_t i = n - kTail; i < n; ++i) {
+                    const float x = bf2f(f2bf(pattern(i, seed))), y = bf2f(f2bf(pattern(i, seed ^ 0x00abcdefu)));
+                    const float ref = bf2f(f2bf(alpha16 * x + y));
+                    if (!(std::fabs((double)bf2f(tail_full[i]) - ref) <= 1e-8 + 1e-2 * std::fabs(ref))) ++tail_bad;
+                }
+                if (tail_bad) ++host_failed;
                 if (c.bad) {
                     ++failed;
                     bad_total += c.bad;
                     if (first.empty()) first = "iteration " + std::to_string(it) + ":" + c.first;
                 }
             }
-            printf("baseline copy path, %-6s: %d/%d launches with wrong output (%lu elements in all)%s%s\n", variants[v], failed,
-                   iters + 1, (unsigned long)bad_total, failed ? "; first: " : "", first.c_str());
+            printf("baseline copy path, %-6s: %d/%d launches with wrong output (%lu elements in all); wrong already in what the "
+                   "CPU read from the NPU buffer (last %lu elements): %d/%d%s%s\n",
+                   variants[v], failed, iters + 1, (unsigned long)bad_total, (unsigned long)kTail, host_failed, iters + 1,
+                   failed ? "; first: " : "", first.c_str());
             if (v == 0) {
                 base_move = move / iters;
                 base_kernel = kern / iters;
