@@ -242,7 +242,7 @@ int main(int argc, char **argv) {
     // ---- part 4: which combinations of imported args work (fresh run each)
     printf("\npart 4: subsets of imported args (fresh run each; others host BOs)\n| alloc | imported | normed | v | q_roped | k_roped |\n|---|---|---|---|---|---|\n");
     const std::vector<std::vector<int>> subsets = {{2, 8}, {0, 2}, {2, 8, 11, 12}, {0, 2, 8, 11, 12}};
-    for (uint64_t alloc : {act, act * 2, 2ull << 20, 4ull << 20, 64ull << 20})
+    for (uint64_t alloc : {act, act * 2, (uint64_t)2 << 20, (uint64_t)4 << 20, (uint64_t)64 << 20})
     for (const auto &sub : subsets) {
         std::vector<xrt::bo> a = host;
         std::vector<std::pair<int, void *>> imp;
