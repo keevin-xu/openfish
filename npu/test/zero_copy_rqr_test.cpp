@@ -238,5 +238,50 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 13; ++i) fresh_imported.set_arg(i, args[i]);
     check("(e) run created with imported, re-launched", args, true, &fresh_imported);
     for (void *p : dps) (void)hipFree(p);
+
+    // ---- part 4: which combinations of imported args work (fresh run each)
+    printf("\npart 4: subsets of imported args (fresh run each; others host BOs)\n| imported | normed | v | q_roped | k_roped |\n|---|---|---|---|---|\n");
+    const std::vector<std::vector<int>> subsets = {{2, 8}, {2, 11}, {2, 12}, {8, 11}, {8, 12}, {11, 12}, {0, 2}, {0, 12},
+                                                   {2, 8, 11}, {2, 8, 12}, {8, 11, 12}, {2, 11, 12}, {2, 8, 11, 12}};
+    for (const auto &sub : subsets) {
+        std::vector<xrt::bo> a = host;
+        std::vector<std::pair<int, void *>> imp;
+        for (int i : sub) {
+            void *dp = hip_alloc(act, false);
+            imp.emplace_back(i, dp);
+            a[i] = import_bo(dev, dp, act);
+            if (i == 0) {
+                HIP_OK(hipMemcpy(dp, host[0].map<uint16_t *>(), act, hipMemcpyHostToDevice));
+            } else {
+                HIP_OK(hipMemset(dp, 0xFF, act));
+            }
+        }
+        HIP_OK(hipDeviceSynchronize());
+        for (int i : {2, 8, 11, 12}) {
+            std::memset(host[i].map<uint8_t *>(), 0xFF, act);
+            host[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        for (int i : {0, 2, 8, 11, 12}) a[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        launch(a);
+        std::string label, res;
+        for (int i : sub) label += std::to_string(i) + " ";
+        for (int i : {2, 8, 11, 12}) {
+            std::vector<uint16_t> got(act / 2);
+            a[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            void *dp = nullptr;
+            for (auto &pr : imp) if (pr.first == i) dp = pr.second;
+            if (dp) {
+                HIP_OK(hipMemcpy(got.data(), dp, act, hipMemcpyDeviceToHost));
+            } else {
+                std::memcpy(got.data(), host[i].map<uint16_t *>(), act);
+            }
+            uint64_t bad = 0;
+            for (uint64_t j = 0; j < act / 2; ++j) bad += got[j] != ref[i][j];
+            res += std::string(" | ") + (bad ? "WRONG" : "ok") + (dp ? "*" : "");
+        }
+        printf("| %s%s |\n", label.c_str(), res.c_str());
+        for (auto &pr : imp) (void)hipFree(pr.second);
+    }
+    printf("(* = that output is an imported iGPU buffer)\n");
     return 0;
 }
