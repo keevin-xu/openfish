@@ -32,7 +32,7 @@ wqkv, out_proj, upsample, crf, rmsnorm, rope, conv (im2col + GEMM).
 
 | # | Kind | Item | How | Status |
 |---|---|---|---|---|
-| B1 | **HAND-CODED EXTRA** | Zero-copy iGPU↔NPU buffers: one buffer seen by both devices instead of iGPU buffer → host RAM → NPU buffer and back | Export the XRT buffer as dma-buf → `hipImportExternalMemory` (fallback: `hipHostRegister` on the XRT mapping); `torch::from_blob`; sync with HIP events + `bo.sync`. In `src/nn_npu.cpp` + the TxModel/CRFModel hooks | step 1 done 10-24 (`npu/test/zero_copy_test.cpp`): works via hipMalloc → dma-buf → XRT import (also hipHostRegister, hipHostMalloc + userptr); XRT → HIP import fails. 2.55 → 0.20 ms data movement per 3 × 8 MiB launch. Step 2: wire into nn_npu.cpp + hooks |
+| B1 | **HAND-CODED EXTRA** | Zero-copy iGPU↔NPU buffers: one buffer seen by both devices instead of iGPU buffer → host RAM → NPU buffer and back | Export the XRT buffer as dma-buf → `hipImportExternalMemory` (fallback: `hipHostRegister` on the XRT mapping); `torch::from_blob`; sync with HIP events + `bo.sync`. In `src/nn_npu.cpp` + the TxModel/CRFModel hooks | step 1 done 10-24 (`npu/test/zero_copy_test.cpp`): works via hipMalloc → dma-buf → XRT import (also hipHostRegister, hipHostMalloc + userptr); XRT → HIP import fails. 2.55 → 0.20 ms data movement per 3 × 8 MiB launch. Step 2: wire into nn_npu.cpp + hooks. **Step 2 in progress 10-24** (`OPENFISH_NPU_ZEROCOPY`): fc1/silu_mul/fc2 done, bit-identical, comb12 119.4 → 105.4 s |
 
 ## C. Extra features (last priority)
 

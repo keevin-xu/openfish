@@ -169,3 +169,9 @@ Guard around every NPU launch in `nn_npu.cpp` (tail marker + re-sync, `OPENFISH_
 in the `[nn_npu]` stats). comb12 re-run (binary 8822a258): guard waited 0 times in 14,752 launches (two runs); guard-on,
 guard-off and the 10-23 run are bit-identical (50/50 reads, median 0.976351, −0.0018). Overhead within noise
 (119.4–122.0 s vs 120.7 s off). Past results stand. Ledger R25.
+
+### 2026-10-24 — zero-copy iGPU<->NPU, step 1 (fc1, silu_mul, fc2)
+`nn_hip.c` allocates iGPU memory and exports it as a dma-buf (`hip_shared_alloc`); `nn_npu.cpp` imports it as an XRT
+BO per (kernel, role) and runs device-pointer variants of the GEMM and silu_mul (`OPENFISH_NPU_ZEROCOPY`); the slorado
+hooks keep tensors on the iGPU with the same casts. 50 reads: group 69.9 → 50.7 s, peak RAM 4.05 → 1.99 GB, bit-identical;
+comb12 119.4 → 105.4 s, bit-identical. Ledger R26 / D31.
