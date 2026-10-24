@@ -163,3 +163,9 @@ comb12 (120.8 s): NPU kernels 61.0 s, nn_npu host in/out 22.1 s, slorado-side co
 XRT userptr; hipMalloc dma-buf + XRT import), all correct over 35 launches; data movement 2.55 → 0.20 ms per 3 × 8 MiB
 launch. XRT dma-buf → HIP import fails (out of memory). The copy path returns stale output tails in 10/31 launches
 (debug_log 2026-10-24). Ledger R23.
+
+### 2026-10-24 — stale-output guard; comb12 unchanged
+Guard around every NPU launch in `nn_npu.cpp` (tail marker + re-sync, `OPENFISH_NPU_GUARD=0` disables; per-op counters
+in the `[nn_npu]` stats). comb12 re-run (binary 8822a258): guard waited 0 times in 14,752 launches (two runs); guard-on,
+guard-off and the 10-23 run are bit-identical (50/50 reads, median 0.976351, −0.0018). Overhead within noise
+(119.4–122.0 s vs 120.7 s off). Past results stand. Ledger R25.

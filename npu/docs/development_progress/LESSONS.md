@@ -58,3 +58,6 @@
 - 2026-10-24: `run.wait()` returning does not guarantee the NPU's last output write is visible to a CPU read of the BO map
   right after `bo.sync(FROM_DEVICE)`: check every launch of a harness with fresh data and a sentinel, not just one launch
   (a single-launch Phase-1 check can miss it; the stale values look plausible because they are the previous launch's).
+- 2026-10-24 (follow-up): the stale-output race reproduced in standalone tests did not occur in slorado's own launch
+  pattern (two guarded comb12 runs: 0 waits in 14,752 launches; unguarded run bit-identical). Test the real pipeline
+  before assuming a microbenchmark failure mode applies to it; keep cheap guards with counters so it stays observable.
