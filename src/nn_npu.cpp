@@ -228,7 +228,7 @@ struct elementwise_kernel_t {
     // template overload and fails with "patch_value() only supports 64-bit values".
     xrt::bo bo_in0, bo_in1, bo_out;
     uint16_t *in0 = nullptr, *in1 = nullptr, *out = nullptr;
-    shared_buf_t zc_in0, zc_in1, zc_out;  // zero-copy path
+    shared_buf_t zc_in[2], zc_out;  // zero-copy path
     xrt::run run;
     npu_stats_t stats;
 
@@ -821,6 +821,7 @@ struct eltwise_kernel_t {
     xrt::ext::kernel kernel;
     xrt::bo bo_in[2], bo_out;
     uint16_t *in[2] = {nullptr, nullptr}, *out = nullptr;
+    shared_buf_t zc_in[2], zc_out;  // zero-copy path
     xrt::run run;
 
     eltwise_kernel_t(const std::string &nm, const std::string &dir, const std::string &js)
@@ -914,6 +915,7 @@ struct rqr_kernel_t {
     xrt::ext::kernel kernel;
     xrt::bo bo[13];
     uint16_t *p[13] = {};
+    shared_buf_t zc[13];  // zero-copy path: args 0 (x) and the outputs read back (2, 8, 11, 12)
     xrt::run run;
     std::unordered_map<const float *, std::vector<xrt::bo>> wqkv;
     std::unordered_map<const float *, xrt::bo> normw;
@@ -956,17 +958,23 @@ xrt::bo bf16_bo(xrt::device &dev, uint64_t n, const std::function<float(uint64_t
 
 }  // namespace
 
+// The axpy kernel, checked against alpha: the kernel holds alpha as a bf16 constant, so the caller's alpha must round
+// to the same bf16 value (SUP's deepnorm alpha is 2.4494897 in fp32 and 2.449219 in the iGPU's fp16 model; both are
+// bf16 2.453125). Caller holds g_mutex.
+static eltwise_kernel_t &axpy_kernel(float alpha) {
+    eltwise_kernel_t &k = get_eltwise("axpy");
+    const float compiled = std::stof(manifest_field(k.json, "alpha"));
+    if (k.inputs != 2 || f32_to_bf16(compiled) != f32_to_bf16(alpha)) {
+        throw std::runtime_error("alpha " + std::to_string(alpha) + " does not round to the compiled bf16 alpha " +
+                                 std::to_string(compiled));
+    }
+    return k;
+}
+
 void axpy_npu_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *out, uint64_t n) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
-        eltwise_kernel_t &k = get_eltwise("axpy");
-        // the kernel holds alpha as a bf16 constant: the caller's alpha must round to the same bf16 value
-        // (SUP's deepnorm alpha is 2.4494897 in fp32 and 2.449219 in the iGPU's fp16 model; both are bf16 2.453125)
-        const float compiled = std::stof(manifest_field(k.json, "alpha"));
-        if (k.inputs != 2 || f32_to_bf16(compiled) != f32_to_bf16(alpha)) {
-            throw std::runtime_error("alpha " + std::to_string(alpha) + " does not round to the compiled bf16 alpha " +
-                                     std::to_string(compiled));
-        }
+        eltwise_kernel_t &k = axpy_kernel(alpha);
         run_eltwise(k, op_stats("residual"), x, y, out, n);
     } catch (const std::exception &e) {
         OPENFISH_ERROR("axpy_npu: %s", e.what());
@@ -986,58 +994,74 @@ void silu_npu_bf16(const uint16_t *x, uint16_t *out, uint64_t n) {
     }
 }
 
+// The fused kernel with this call's LUTs, norm weight and q/k/v weights bound (caller holds g_mutex).
+static rqr_kernel_t &rqr_prepare(const float *norm_w, const float *wqkv, const float *lut, uint64_t rows, uint64_t T,
+                                 npu_stats_t *&stats_out) {
+    if (!g_rqr) {
+        const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
+        if (!dir) throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
+        const std::string json = read_file(std::string(dir) + "/rms_qkv_rope.json");
+        init_common();
+        g_rqr = new rqr_kernel_t(dir, json);
+        fprintf(stderr, "[nn_npu] loaded rms_qkv_rope: %s/%s (sha256 %s), kernel %s, m=%lu d=%lu heads=%lu, gemm %s\n", dir,
+                manifest_field(json, "file").c_str(), manifest_field(json, "sha256").c_str(),
+                manifest_field(json, "kernel_name").c_str(), (unsigned long)g_rqr->m, (unsigned long)g_rqr->d,
+                (unsigned long)g_rqr->heads, manifest_field(json, "gemm_method").c_str());
+    }
+    rqr_kernel_t &k = *g_rqr;
+    npu_stats_t &stats = op_stats("rms_qkv_rope");
+    const uint64_t m = k.m, d = k.d;
+    if (T % m || rows % T) {
+        throw std::runtime_error("T " + std::to_string(T) + " must be a multiple of the compiled rows " +
+                                 std::to_string(m) + " and rows a multiple of T");
+    }
+    auto t0 = clock_type::now();
+    if (k.lut_key != lut || k.lut_T != T) {
+        k.luts.clear();
+        const uint64_t per = m * d;  // m positions x heads rows x head_dim
+        for (uint64_t t = 0; t < T; t += m) {
+            const float *src = lut + t * d;
+            k.luts.push_back(bf16_bo(k.device, per, [&](uint64_t i) { return src[i]; }));
+        }
+        k.lut_key = lut;
+        k.lut_T = T;
+    }
+    auto nw = k.normw.find(norm_w);
+    if (nw == k.normw.end()) {
+        nw = k.normw.emplace(norm_w, bf16_bo(k.device, d, [&](uint64_t i) { return norm_w[i]; })).first;
+    }
+    auto w = k.wqkv.find(wqkv);
+    if (w == k.wqkv.end()) {
+        std::vector<xrt::bo> v;
+        for (uint64_t sl = 0; sl < 3; ++sl) {  // B[e, j] = W[sl*d + j, e]
+            const float *ws = wqkv + sl * d * d;
+            v.push_back(bf16_bo(k.device, d * d, [&](uint64_t i) { return ws[(i % d) * d + i / d]; }));
+        }
+        w = k.wqkv.emplace(wqkv, std::move(v)).first;
+    }
+    k.run.set_arg(1, nw->second);
+    k.run.set_arg(3, w->second[0]);
+    k.run.set_arg(5, w->second[1]);
+    k.run.set_arg(7, w->second[2]);
+    stats.t_in += seconds_since(t0);
+    stats_out = &stats;
+    return k;
+}
+
+// Bind the host-mapped activation buffers (the zero-copy path rebinds them for its calls).
+static void rqr_bind_host(rqr_kernel_t &k) {
+    for (int i : {0, 2, 4, 6, 8, 11, 12}) k.run.set_arg(i, k.bo[i]);
+}
+
 void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *wqkv, const float *lut, uint16_t *normed,
                            uint16_t *qkv, uint64_t rows, uint64_t T) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
-        if (!g_rqr) {
-            const char *dir = std::getenv("OPENFISH_NPU_ARTIFACTS");
-            if (!dir) throw std::runtime_error("OPENFISH_NPU_ARTIFACTS is not set");
-            const std::string json = read_file(std::string(dir) + "/rms_qkv_rope.json");
-            init_common();
-            g_rqr = new rqr_kernel_t(dir, json);
-            fprintf(stderr, "[nn_npu] loaded rms_qkv_rope: %s/%s (sha256 %s), kernel %s, m=%lu d=%lu heads=%lu, gemm %s\n", dir,
-                    manifest_field(json, "file").c_str(), manifest_field(json, "sha256").c_str(),
-                    manifest_field(json, "kernel_name").c_str(), (unsigned long)g_rqr->m, (unsigned long)g_rqr->d,
-                    (unsigned long)g_rqr->heads, manifest_field(json, "gemm_method").c_str());
-        }
-        rqr_kernel_t &k = *g_rqr;
-        npu_stats_t &stats = op_stats("rms_qkv_rope");
+        npu_stats_t *sp = nullptr;
+        rqr_kernel_t &k = rqr_prepare(norm_w, wqkv, lut, rows, T, sp);
+        npu_stats_t &stats = *sp;
+        rqr_bind_host(k);
         const uint64_t m = k.m, d = k.d;
-        if (T % m || rows % T) {
-            throw std::runtime_error("T " + std::to_string(T) + " must be a multiple of the compiled rows " +
-                                     std::to_string(m) + " and rows a multiple of T");
-        }
-        auto t0 = clock_type::now();
-        if (k.lut_key != lut || k.lut_T != T) {
-            k.luts.clear();
-            const uint64_t per = m * d;  // m positions x heads rows x head_dim
-            for (uint64_t t = 0; t < T; t += m) {
-                const float *src = lut + t * d;
-                k.luts.push_back(bf16_bo(k.device, per, [&](uint64_t i) { return src[i]; }));
-            }
-            k.lut_key = lut;
-            k.lut_T = T;
-        }
-        auto nw = k.normw.find(norm_w);
-        if (nw == k.normw.end()) {
-            nw = k.normw.emplace(norm_w, bf16_bo(k.device, d, [&](uint64_t i) { return norm_w[i]; })).first;
-        }
-        auto w = k.wqkv.find(wqkv);
-        if (w == k.wqkv.end()) {
-            std::vector<xrt::bo> v;
-            for (uint64_t sl = 0; sl < 3; ++sl) {  // B[e, j] = W[sl*d + j, e]
-                const float *ws = wqkv + sl * d * d;
-                v.push_back(bf16_bo(k.device, d * d, [&](uint64_t i) { return ws[(i % d) * d + i / d]; }));
-            }
-            w = k.wqkv.emplace(wqkv, std::move(v)).first;
-        }
-        k.run.set_arg(1, nw->second);
-        k.run.set_arg(3, w->second[0]);
-        k.run.set_arg(5, w->second[1]);
-        k.run.set_arg(7, w->second[2]);
-        stats.t_in += seconds_since(t0);
-
         const uint64_t launches = rows / m;
         for (uint64_t l = 0; l < launches; ++l) {
             const uint64_t begin = l * m;
@@ -1125,34 +1149,57 @@ void shared_ensure(shared_buf_t &s, xrt::device &device, uint64_t bytes) {
     s.bytes = bytes;
 }
 
-// Stale-output guard for a shared output: the marker is written and the tail read back by the iGPU.
+uint8_t *bytes_at(const shared_buf_t &s, uint64_t off) { return static_cast<uint8_t *>(s.dptr) + off; }
+
+// Stale-output guard for shared outputs: the iGPU writes the marker (async, before the launch's hip_sync) and, after
+// the launch, reads every output's tail back in one sync.
 void guard_arm_dev(shared_buf_t &s, uint64_t bytes) {
     if (!guard_on()) return;
-    const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
-    hip_memset_sync(static_cast<uint8_t *>(s.dptr) + off, 0xFF, g);
+    const uint64_t g = std::min(bytes, kGuardBytes);
+    hip_memset_async(bytes_at(s, bytes - g), 0xFF, g);
 }
 
-void guard_wait_dev(shared_buf_t &s, uint64_t bytes, uint64_t elem_bytes, npu_stats_t &stats) {
+void guard_wait_dev(std::initializer_list<shared_buf_t *> bufs, uint64_t bytes, uint64_t elem_bytes, npu_stats_t &stats) {
     if (!guard_on()) return;
     const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
-    uint8_t tail[kGuardBytes];
-    hip_copy_sync(tail, static_cast<uint8_t *>(s.dptr) + off, g);
-    if (!guard_marked(tail, g, elem_bytes)) return;
-    auto t0 = clock_type::now();
-    stats.guard_retried += 1;
-    while (guard_marked(tail, g, elem_bytes)) {
-        if (seconds_since(t0) > kGuardTimeout) {
-            stats.guard_timeouts += 1;
-            break;
+    static std::vector<uint8_t> tails;
+    tails.resize(bufs.size() * g);
+    size_t i = 0;
+    for (shared_buf_t *s : bufs) hip_copy_async(tails.data() + g * i++, bytes_at(*s, off), g);
+    hip_sync();
+    i = 0;
+    for (shared_buf_t *s : bufs) {
+        uint8_t *tail = tails.data() + g * i++;
+        if (!guard_marked(tail, g, elem_bytes)) continue;
+        auto t0 = clock_type::now();
+        stats.guard_retried += 1;
+        while (guard_marked(tail, g, elem_bytes)) {
+            if (seconds_since(t0) > kGuardTimeout) {
+                stats.guard_timeouts += 1;
+                break;
+            }
+            s->bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, g, off);
+            hip_copy_async(tail, bytes_at(*s, off), g);
+            hip_sync();
+            stats.guard_polls += 1;
         }
-        s.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, g, off);
-        hip_copy_sync(tail, static_cast<uint8_t *>(s.dptr) + off, g);
-        stats.guard_polls += 1;
+        stats.guard_wait += seconds_since(t0);
     }
-    stats.guard_wait += seconds_since(t0);
+}
+
+void launch_wait(xrt::run &run, const std::string &what) {
+    run.start();
+    if (run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+        throw std::runtime_error(what + " launch timed out after 60 s");
+    }
 }
 
 }  // namespace
+
+// Per launch, every zero-copy op below: queue the iGPU copies of this launch's input rows into the shared input
+// buffers (and the guard markers), hip_sync (which also completes the previous launch's output copies), sync the
+// input BOs, run, sync the output BOs, guard, queue the output copies. "host in/out" in the stats are now these iGPU
+// copies and syncs.
 
 // out[rows, N] = x[rows, K] @ weight[N, K].T with x (bf16) and out (Out) in iGPU memory.
 template <typename Out>
@@ -1168,10 +1215,10 @@ static void linear_dev_impl(const char *op, const uint16_t *dx, Out *dout, const
             throw std::runtime_error(f32 ? "f32 output requested but the GEMM ELF is bfp16w (unset OPENFISH_NPU_GEMM_OUT)"
                                          : "bf16 output requested but the GEMM ELF is f32-out (set OPENFISH_NPU_GEMM_OUT=f32)");
         }
-        const uint64_t m = g.m, eb = sizeof(Out);
-        shared_ensure(g.zc_a, g.device, m * K * sizeof(uint16_t));
+        const uint64_t m = g.m, eb = sizeof(Out), a_bytes = m * K * sizeof(uint16_t), c_bytes = m * N * eb;
+        shared_ensure(g.zc_a, g.device, a_bytes);
         shared_buf_t &zo = f32 ? g.zc_c32 : g.zc_c16;
-        shared_ensure(zo, g.device, m * N * eb);
+        shared_ensure(zo, g.device, c_bytes);
         gemm_bind_host(g);  // the output this call does not read stays host-mapped (fused-cast has both)
         g.run.set_arg(0, g.zc_a.bo);
         g.run.set_arg(f32 || g.method == "bfp16w" ? 2 : 3, zo.bo);
@@ -1181,27 +1228,25 @@ static void linear_dev_impl(const char *op, const uint16_t *dx, Out *dout, const
             const uint64_t begin = l * m;
             const uint64_t count = std::min(m, rows - begin);
             auto t1 = clock_type::now();
-            hip_copy_sync(g.zc_a.dptr, dx + begin * K, count * K * sizeof(uint16_t));
-            if (count < m) {
-                hip_memset_sync(static_cast<uint8_t *>(g.zc_a.dptr) + count * K * sizeof(uint16_t), 0,
-                                (m - count) * K * sizeof(uint16_t));
-            }
+            hip_copy_async(g.zc_a.dptr, dx + begin * K, count * K * sizeof(uint16_t));
+            if (count < m) hip_memset_async(bytes_at(g.zc_a, count * K * sizeof(uint16_t)), 0, (m - count) * K * sizeof(uint16_t));
+            guard_arm_dev(zo, c_bytes);
+            hip_sync();
             g.zc_a.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            guard_arm_dev(zo, m * N * eb);
             auto t2 = clock_type::now();
-            g.run.start();
-            if (g.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
-                throw std::runtime_error(std::string(op) + " launch timed out after 60 s");
-            }
+            launch_wait(g.run, op);
             auto t3 = clock_type::now();
             zo.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            guard_wait_dev(zo, m * N * eb, eb, stats);
-            hip_copy_sync(dout + begin * N, zo.dptr, count * N * eb);
+            guard_wait_dev({&zo}, c_bytes, eb, stats);
+            hip_copy_async(dout + begin * N, zo.dptr, count * N * eb);
             auto t4 = clock_type::now();
             stats.t_in += std::chrono::duration<double>(t2 - t1).count();
             stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
             stats.t_out += std::chrono::duration<double>(t4 - t3).count();
         }
+        auto t5 = clock_type::now();
+        hip_sync();
+        stats.t_out += seconds_since(t5);
         gemm_bind_host(g);
         stats.calls += 1;
         stats.launches += launches;
@@ -1213,60 +1258,51 @@ static void linear_dev_impl(const char *op, const uint16_t *dx, Out *dout, const
     }
 }
 
-// silu_mul with gate, up and out (bf16, total elements each) in iGPU memory; kernel args (gate, up, out).
-static void silu_mul_dev_impl(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total) {
-    std::lock_guard<std::mutex> guard(g_mutex);
-    try {
-        if (!g_silu_mul) {
-            g_silu_mul = load_silu_mul();
-        }
-        elementwise_kernel_t &k = *g_silu_mul;
-        const uint64_t n = k.n, bytes = n * sizeof(uint16_t);
-        shared_ensure(k.zc_in0, k.device, bytes);
-        shared_ensure(k.zc_in1, k.device, bytes);
-        shared_ensure(k.zc_out, k.device, bytes);
-        k.run.set_arg(0, k.zc_in0.bo);
-        k.run.set_arg(1, k.zc_in1.bo);
-        k.run.set_arg(2, k.zc_out.bo);
-        const uint64_t launches = (total + n - 1) / n;
-        for (uint64_t l = 0; l < launches; ++l) {
-            const uint64_t begin = l * n;
-            const uint64_t count = std::min(n, total - begin);
-            auto t0 = clock_type::now();
-            hip_copy_sync(k.zc_in0.dptr, dgate + begin, count * sizeof(uint16_t));
-            hip_copy_sync(k.zc_in1.dptr, dup + begin, count * sizeof(uint16_t));
-            if (count < n) {
-                hip_memset_sync(static_cast<uint16_t *>(k.zc_in0.dptr) + count, 0, (n - count) * sizeof(uint16_t));
-                hip_memset_sync(static_cast<uint16_t *>(k.zc_in1.dptr) + count, 0, (n - count) * sizeof(uint16_t));
-            }
-            k.zc_in0.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            k.zc_in1.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            guard_arm_dev(k.zc_out, bytes);
-            auto t1 = clock_type::now();
-            k.run.start();
-            if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
-                throw std::runtime_error("silu_mul launch timed out after 60 s");
-            }
-            auto t2 = clock_type::now();
-            k.zc_out.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            guard_wait_dev(k.zc_out, bytes, 2, k.stats);
-            hip_copy_sync(dout + begin, k.zc_out.dptr, count * sizeof(uint16_t));
-            auto t3 = clock_type::now();
-            k.stats.t_in += std::chrono::duration<double>(t1 - t0).count();
-            k.stats.t_kernel += std::chrono::duration<double>(t2 - t1).count();
-            k.stats.t_out += std::chrono::duration<double>(t3 - t2).count();
-        }
-        k.run.set_arg(0, k.bo_in0);
-        k.run.set_arg(1, k.bo_in1);
-        k.run.set_arg(2, k.bo_out);
-        k.stats.calls += 1;
-        k.stats.launches += launches;
-        k.stats.zc_launches += launches;
-        k.stats.elements += total;
-    } catch (const std::exception &e) {
-        OPENFISH_ERROR("silu_mul_npu_dev: %s", e.what());
-        exit(EXIT_FAILURE);
+// Elementwise kernel with ins (1 or 2) bf16 inputs and one bf16 output of `total` elements each, all in iGPU memory;
+// n per launch, the last launch zero-padded.
+template <typename K>
+static void eltwise_dev_run(K &k, shared_buf_t *zin, shared_buf_t &zout, xrt::bo *host_in, xrt::bo &host_out, int ins,
+                            const uint16_t *const *din, uint16_t *dout, uint64_t n, uint64_t total, npu_stats_t &stats,
+                            const std::string &what) {
+    const uint64_t bytes = n * sizeof(uint16_t);
+    for (int i = 0; i < ins; ++i) {
+        shared_ensure(zin[i], k.device, bytes);
+        k.run.set_arg(i, zin[i].bo);
     }
+    shared_ensure(zout, k.device, bytes);
+    k.run.set_arg(ins, zout.bo);
+    const uint64_t launches = (total + n - 1) / n;
+    for (uint64_t l = 0; l < launches; ++l) {
+        const uint64_t begin = l * n;
+        const uint64_t count = std::min(n, total - begin);
+        auto t0 = clock_type::now();
+        for (int i = 0; i < ins; ++i) {
+            hip_copy_async(zin[i].dptr, din[i] + begin, count * sizeof(uint16_t));
+            if (count < n) hip_memset_async(bytes_at(zin[i], count * sizeof(uint16_t)), 0, (n - count) * sizeof(uint16_t));
+        }
+        guard_arm_dev(zout, bytes);
+        hip_sync();
+        for (int i = 0; i < ins; ++i) zin[i].bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t1 = clock_type::now();
+        launch_wait(k.run, what);
+        auto t2 = clock_type::now();
+        zout.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        guard_wait_dev({&zout}, bytes, 2, stats);
+        hip_copy_async(dout + begin, zout.dptr, count * sizeof(uint16_t));
+        auto t3 = clock_type::now();
+        stats.t_in += std::chrono::duration<double>(t1 - t0).count();
+        stats.t_kernel += std::chrono::duration<double>(t2 - t1).count();
+        stats.t_out += std::chrono::duration<double>(t3 - t2).count();
+    }
+    auto t4 = clock_type::now();
+    hip_sync();
+    stats.t_out += seconds_since(t4);
+    for (int i = 0; i < ins; ++i) k.run.set_arg(i, host_in[i]);
+    k.run.set_arg(ins, host_out);
+    stats.calls += 1;
+    stats.launches += launches;
+    stats.zc_launches += launches;
+    stats.elements += total;
 }
 
 void linear_npu_dev_bf16_f32(const char *op, const uint16_t *dx, float *dout, const float *w, uint64_t rows, uint64_t K,
@@ -1277,8 +1313,99 @@ void linear_npu_dev_bf16(const char *op, const uint16_t *dx, uint16_t *dout, con
                          uint64_t N) {
     linear_dev_impl(op, dx, dout, w, rows, K, N);
 }
+
+// silu_mul: kernel args (gate, up, out)
 void silu_mul_npu_dev_bf16(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total) {
-    silu_mul_dev_impl(dgate, dup, dout, total);
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        if (!g_silu_mul) g_silu_mul = load_silu_mul();
+        elementwise_kernel_t &k = *g_silu_mul;
+        const uint16_t *din[2] = {dgate, dup};
+        xrt::bo host_in[2] = {k.bo_in0, k.bo_in1};
+        eltwise_dev_run(k, k.zc_in, k.zc_out, host_in, k.bo_out, 2, din, dout, k.n, total, k.stats, "silu_mul");
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("silu_mul_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void axpy_npu_dev_bf16(float alpha, const uint16_t *dx, const uint16_t *dy, uint16_t *dout, uint64_t n) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        eltwise_kernel_t &k = axpy_kernel(alpha);
+        const uint16_t *din[2] = {dx, dy};
+        eltwise_dev_run(k, k.zc_in, k.zc_out, k.bo_in, k.bo_out, 2, din, dout, k.n, n, op_stats("residual"), "axpy");
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("axpy_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void silu_npu_dev_bf16(const uint16_t *dx, uint16_t *dout, uint64_t n) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        eltwise_kernel_t &k = get_eltwise("silu");
+        if (k.inputs != 1) throw std::runtime_error("silu manifest: expected 1 input");
+        const uint16_t *din[1] = {dx};
+        eltwise_dev_run(k, k.zc_in, k.zc_out, k.bo_in, k.bo_out, 1, din, dout, k.n, n, op_stats("swish"), "silu");
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("silu_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Fused norm2 + wqkv + RoPE with x, normed and qkv in iGPU memory; qkv rows are [q_roped | k_roped | v] (3 strided
+// copies per launch out of the kernel's three [m, d] outputs).
+void rms_qkv_rope_npu_dev_bf16(const uint16_t *dx, const float *norm_w, const float *wqkv, const float *lut, uint16_t *dnormed,
+                               uint16_t *dqkv, uint64_t rows, uint64_t T) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        npu_stats_t *sp = nullptr;
+        rqr_kernel_t &k = rqr_prepare(norm_w, wqkv, lut, rows, T, sp);
+        npu_stats_t &stats = *sp;
+        const uint64_t m = k.m, d = k.d, bytes = m * d * sizeof(uint16_t), row = d * sizeof(uint16_t);
+        for (int i : {0, 2, 8, 11, 12}) {
+            shared_ensure(k.zc[i], k.device, bytes);
+            k.run.set_arg(i, k.zc[i].bo);
+        }
+        const uint64_t launches = rows / m;
+        for (uint64_t l = 0; l < launches; ++l) {
+            const uint64_t begin = l * m;
+            auto t1 = clock_type::now();
+            const xrt::bo &lb = k.luts[(begin % T) / m];
+            k.run.set_arg(9, lb);
+            k.run.set_arg(10, lb);
+            hip_copy_async(k.zc[0].dptr, dx + begin * d, bytes);
+            for (int i : {2, 8, 11, 12}) guard_arm_dev(k.zc[i], bytes);
+            hip_sync();
+            k.zc[0].bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto t2 = clock_type::now();
+            launch_wait(k.run, "rms_qkv_rope");
+            auto t3 = clock_type::now();
+            for (int i : {2, 8, 11, 12}) k.zc[i].bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            guard_wait_dev({&k.zc[2], &k.zc[8], &k.zc[11], &k.zc[12]}, bytes, 2, stats);
+            hip_copy_async(dnormed + begin * d, k.zc[2].dptr, bytes);
+            uint16_t *q = dqkv + begin * 3 * d;
+            hip_copy2d_async(q, 3 * row, k.zc[11].dptr, row, row, m);          // q_roped
+            hip_copy2d_async(q + d, 3 * row, k.zc[12].dptr, row, row, m);      // k_roped
+            hip_copy2d_async(q + 2 * d, 3 * row, k.zc[8].dptr, row, row, m);   // v
+            auto t4 = clock_type::now();
+            stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+            stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+            stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+        }
+        auto t5 = clock_type::now();
+        hip_sync();
+        stats.t_out += seconds_since(t5);
+        rqr_bind_host(k);
+        stats.calls += 1;
+        stats.launches += launches;
+        stats.zc_launches += launches;
+        stats.elements += rows * d;
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rms_qkv_rope_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
 }
 #else
 static void zerocopy_unavailable() {
@@ -1292,6 +1419,12 @@ void linear_npu_dev_bf16(const char *, const uint16_t *, uint16_t *, const float
     zerocopy_unavailable();
 }
 void silu_mul_npu_dev_bf16(const uint16_t *, const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
+void axpy_npu_dev_bf16(float, const uint16_t *, const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
+void silu_npu_dev_bf16(const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
+void rms_qkv_rope_npu_dev_bf16(const uint16_t *, const float *, const float *, const float *, uint16_t *, uint16_t *, uint64_t,
+                               uint64_t) {
+    zerocopy_unavailable();
+}
 #endif
 
 void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }

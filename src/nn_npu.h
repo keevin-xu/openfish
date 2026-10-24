@@ -49,6 +49,10 @@ void linear_npu_dev_bf16(const char *op, const uint16_t *dx, uint16_t *dout, con
                          uint64_t N);
 // gate, up, out: total bf16 elements each (rows of [y | gate] already split on the iGPU)
 void silu_mul_npu_dev_bf16(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total);
+void axpy_npu_dev_bf16(float alpha, const uint16_t *dx, const uint16_t *dy, uint16_t *dout, uint64_t n);
+void silu_npu_dev_bf16(const uint16_t *dx, uint16_t *dout, uint64_t n);
+void rms_qkv_rope_npu_dev_bf16(const uint16_t *dx, const float *norm_w, const float *wqkv, const float *lut, uint16_t *dnormed,
+                               uint16_t *dqkv, uint64_t rows, uint64_t T);
 
 #ifdef __cplusplus
 }
