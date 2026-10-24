@@ -156,3 +156,10 @@ Ledger R21/R22 in `npu-adapting/9-16-npu-adapting-session/results-ledger.md`.
 Ports that work combined with the 10-14 ops (R22 12-op run, native f32-out GEMMs, −0.0018): A2, A5 (native), A7.
 A6 (partial: only without conv, −0.0069) and A8 (breaks every combined run) moved to new section D at the bottom of
 `npu/docs/porting_targets.md`, gated on C7 / C8.
+
+### 2026-10-24 — B1 step 1: zero-copy works; comb12 breakdown
+comb12 (120.8 s): NPU kernels 61.0 s, nn_npu host in/out 22.1 s, slorado-side copies/casts ≈ 30.8 s, iGPU attention ≈ 6 s.
+`npu/test/zero_copy_test.cpp`: iGPU↔NPU shared buffers work three ways (XRT BO + hipHostRegister; hipHostMalloc +
+XRT userptr; hipMalloc dma-buf + XRT import), all correct over 35 launches; data movement 2.55 → 0.20 ms per 3 × 8 MiB
+launch. XRT dma-buf → HIP import fails (out of memory). The copy path returns stale output tails in 10/31 launches
+(debug_log 2026-10-24). Ledger R23.

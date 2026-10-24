@@ -54,3 +54,7 @@
   mean_rel_L1 ~1e-7): validate per tile config, not per file.
 - bf16_in_fp32_out's mm_aie2p.cc is byte-identical to bf16_in_bf16_out's; the only difference is the module (one
   launch, f32 C). Its f32 C equals the fused-cast ELF's f32 scratch.
+
+- 2026-10-24: `run.wait()` returning does not guarantee the NPU's last output write is visible to a CPU read of the BO map
+  right after `bo.sync(FROM_DEVICE)`: check every launch of a harness with fresh data and a sentinel, not just one launch
+  (a single-launch Phase-1 check can miss it; the stale values look plausible because they are the previous launch's).

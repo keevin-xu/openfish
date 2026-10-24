@@ -14,3 +14,8 @@
   template matched `xrt::ext::bo` better than the `const xrt::bo&` overload, so the BO was patched as a 32-byte
   scalar. Fix: hold BOs as `xrt::bo` built from `xrt::ext::bo(...)`.
 - `git add include/openfish/openfish.h` refused (openfish `.gitignore` has `include`, tracked file) → needed `-f`.
+
+### 2026-10-24 — stale tail in NPU output after run.wait() (copy path)
+- Found by `npu/test/zero_copy_test.cpp` baseline (axpy ELF, n 4,194,304 bf16, ext::bo + bo.sync(FROM_DEVICE) + memcpy from the map — the nn_npu.cpp pattern): 10/31 launches have 8–328 wrong elements, all within the last 512 elements, each equal to the previous launch's result at that index.
+- 2 ms sleep after `run.wait2()` before `bo.sync(FROM_DEVICE)`: 0/31. sync, 2 ms, sync again: 0/31. Zero-copy reads by the iGPU (methods B/C/D): 0/35 each.
+- Interpretation: the last output DMA can complete after the run reports done (or the first sync's cache invalidation runs too early). Not yet fixed in nn_npu.cpp; open question how often it hits real ops and whether it moved past identity numbers.
