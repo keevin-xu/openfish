@@ -19,3 +19,9 @@
 - Found by `npu/test/zero_copy_test.cpp` baseline (axpy ELF, n 4,194,304 bf16, ext::bo + bo.sync(FROM_DEVICE) + memcpy from the map — the nn_npu.cpp pattern): 10/31 launches have 8–328 wrong elements, all within the last 512 elements, each equal to the previous launch's result at that index.
 - 2 ms sleep after `run.wait2()` before `bo.sync(FROM_DEVICE)`: 0/31. sync, 2 ms, sync again: 0/31. Zero-copy reads by the iGPU (methods B/C/D): 0/35 each.
 - Interpretation: the last output DMA can complete after the run reports done (or the first sync's cache invalidation runs too early). Not yet fixed in nn_npu.cpp; open question how often it hits real ops and whether it moved past identity numbers.
+
+### 2026-10-24 (cont.) — race diagnostic
+- Runtime sequence awaits every output DMA task: not a missing wait in our builds.
+- `npu/test/tail_race_test.cpp` (XRT only): with the nn_npu.cpp pattern, 1 / ≈ 3,400 launches over 9 kernel kinds (rope_d64: last 392 elements = previous launch's, correct after 1.05 ms). With the CPU writing + syncing the output before each launch (sentinel modes): 0 / ≈ 6,800.
+- Same pattern with HIP active (`zero_copy_test` baseline, axpy): 5/41 launches, already wrong in the CPU's read of the BO.
+- Candidate fix: before each launch write a sentinel into the output's last few KiB and sync that range; after wait + sync, poll that range until the sentinel is gone. Sound as a detector: the CPU's last write there is the sentinel, so anything else read is the NPU's new data.
