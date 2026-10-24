@@ -225,8 +225,12 @@ void openfish_linear_npu_dev_bf16(const char *op, const uint16_t *in, uint16_t *
 void openfish_silu_mul_npu_dev_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *out, uint64_t n);
 void openfish_axpy_npu_dev_bf16(float alpha, const uint16_t *x, const uint16_t *y, uint16_t *out, uint64_t n);
 void openfish_silu_npu_dev_bf16(const uint16_t *in, uint16_t *out, uint64_t n);
+void openfish_rmsnorm_npu_dev_bf16(const uint16_t *in, const float *weight, uint16_t *out, uint64_t n_rows, uint64_t dim);
+void openfish_rope_npu_dev_bf16(const uint16_t *in, const float *lut, uint16_t *out, uint64_t n_rows, uint64_t head_dim);
+// normed, q (roped), k (roped), v: [n_rows, dim] each
 void openfish_rms_qkv_rope_npu_dev_bf16(const uint16_t *in, const float *norm_weight, const float *wqkv_weight,
-                                        const float *lut, uint16_t *normed, uint16_t *qkv, uint64_t n_rows, uint64_t seq_len);
+                                        const float *lut, uint16_t *normed, uint16_t *q, uint16_t *k, uint16_t *v,
+                                        uint64_t n_rows, uint64_t seq_len);
 
 #endif // HAVE_NPU
 

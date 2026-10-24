@@ -676,6 +676,7 @@ struct kernel3_t {
     xrt::ext::kernel kernel;
     xrt::bo bo_a, bo_b, bo_c;
     uint16_t *pa = nullptr, *pb = nullptr, *pc = nullptr;
+    shared_buf_t zc_a, zc_c;  // zero-copy path
     xrt::run run;
     const void *b_key = nullptr;  // host pointer whose contents are currently in bo_b
 
@@ -733,8 +734,8 @@ npu_stats_t &op_stats(const char *op) {
 }
 
 // Row-chunked launch: x[rows, n] -> y[rows, n]; buffer b holds `bconst` (b elements), uploaded when it changes.
-template <typename In, typename Out>
-void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t rows, const float *bconst) {
+// Upload buffer b (`bconst`, b elements) when it changes.
+void rows_upload_b(kernel3_t &k, npu_stats_t &stats, const float *bconst) {
     auto t0 = clock_type::now();
     if (k.b_key != bconst) {
         parallel_for(k.b, g_threads, [&](uint64_t lo, uint64_t hi) {
@@ -744,6 +745,11 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t ro
         k.b_key = bconst;
     }
     stats.t_in += seconds_since(t0);
+}
+
+template <typename In, typename Out>
+void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t rows, const float *bconst) {
+    rows_upload_b(k, stats, bconst);
     const uint64_t launches = (rows + k.m - 1) / k.m;
     for (uint64_t l = 0; l < launches; ++l) {
         const uint64_t begin = l * k.m;
@@ -1354,16 +1360,16 @@ void silu_npu_dev_bf16(const uint16_t *dx, uint16_t *dout, uint64_t n) {
     }
 }
 
-// Fused norm2 + wqkv + RoPE with x, normed and qkv in iGPU memory; qkv rows are [q_roped | k_roped | v] (3 strided
-// copies per launch out of the kernel's three [m, d] outputs).
+// Fused norm2 + wqkv + RoPE with x and the outputs in iGPU memory: normed, q (roped), k (roped) and v, each [rows, d]
+// (contiguous copies out of the kernel's [m, d] outputs; the caller concatenates q | k | v on the iGPU).
 void rms_qkv_rope_npu_dev_bf16(const uint16_t *dx, const float *norm_w, const float *wqkv, const float *lut, uint16_t *dnormed,
-                               uint16_t *dqkv, uint64_t rows, uint64_t T) {
+                               uint16_t *dq, uint16_t *dk, uint16_t *dv, uint64_t rows, uint64_t T) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
         npu_stats_t *sp = nullptr;
         rqr_kernel_t &k = rqr_prepare(norm_w, wqkv, lut, rows, T, sp);
         npu_stats_t &stats = *sp;
-        const uint64_t m = k.m, d = k.d, bytes = m * d * sizeof(uint16_t), row = d * sizeof(uint16_t);
+        const uint64_t m = k.m, d = k.d, bytes = m * d * sizeof(uint16_t);
         for (int i : {0, 2, 8, 11, 12}) {
             shared_ensure(k.zc[i], k.device, bytes);
             k.run.set_arg(i, k.zc[i].bo);
@@ -1385,10 +1391,9 @@ void rms_qkv_rope_npu_dev_bf16(const uint16_t *dx, const float *norm_w, const fl
             for (int i : {2, 8, 11, 12}) k.zc[i].bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             guard_wait_dev({&k.zc[2], &k.zc[8], &k.zc[11], &k.zc[12]}, bytes, 2, stats);
             hip_copy_async(dnormed + begin * d, k.zc[2].dptr, bytes);
-            uint16_t *q = dqkv + begin * 3 * d;
-            hip_copy2d_async(q, 3 * row, k.zc[11].dptr, row, row, m);          // q_roped
-            hip_copy2d_async(q + d, 3 * row, k.zc[12].dptr, row, row, m);      // k_roped
-            hip_copy2d_async(q + 2 * d, 3 * row, k.zc[8].dptr, row, row, m);   // v
+            hip_copy_async(dq + begin * d, k.zc[11].dptr, bytes);  // q_roped
+            hip_copy_async(dk + begin * d, k.zc[12].dptr, bytes);  // k_roped
+            hip_copy_async(dv + begin * d, k.zc[8].dptr, bytes);   // v
             auto t4 = clock_type::now();
             stats.t_in += std::chrono::duration<double>(t2 - t1).count();
             stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
@@ -1407,6 +1412,72 @@ void rms_qkv_rope_npu_dev_bf16(const uint16_t *dx, const float *norm_w, const fl
         exit(EXIT_FAILURE);
     }
 }
+// Row kernels (rmsnorm: X, W, Y; rope: src, lut, dst) with x and y in iGPU memory; b stays a host-uploaded constant.
+static void run_rows_dev(kernel3_t &k, npu_stats_t &stats, const uint16_t *dx, uint16_t *dy, uint64_t rows, const float *bconst) {
+    rows_upload_b(k, stats, bconst);
+    const uint64_t n = k.n, bytes = k.m * n * sizeof(uint16_t);
+    shared_ensure(k.zc_a, k.device, bytes);
+    shared_ensure(k.zc_c, k.device, bytes);
+    k.run.set_arg(0, k.zc_a.bo);
+    k.run.set_arg(2, k.zc_c.bo);
+    const uint64_t launches = (rows + k.m - 1) / k.m;
+    for (uint64_t l = 0; l < launches; ++l) {
+        const uint64_t begin = l * k.m;
+        const uint64_t count = std::min(k.m, rows - begin);
+        auto t1 = clock_type::now();
+        hip_copy_async(k.zc_a.dptr, dx + begin * n, count * n * sizeof(uint16_t));
+        if (count < k.m) hip_memset_async(bytes_at(k.zc_a, count * n * sizeof(uint16_t)), 0, (k.m - count) * n * sizeof(uint16_t));
+        guard_arm_dev(k.zc_c, bytes);
+        hip_sync();
+        k.zc_a.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t2 = clock_type::now();
+        launch_wait(k.run, k.name);
+        auto t3 = clock_type::now();
+        k.zc_c.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        guard_wait_dev({&k.zc_c}, bytes, 2, stats);
+        hip_copy_async(dy + begin * n, k.zc_c.dptr, count * n * sizeof(uint16_t));
+        auto t4 = clock_type::now();
+        stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+        stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+        stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+    }
+    auto t5 = clock_type::now();
+    hip_sync();
+    stats.t_out += seconds_since(t5);
+    k.run.set_arg(0, k.bo_a);
+    k.run.set_arg(2, k.bo_c);
+    stats.calls += 1;
+    stats.launches += launches;
+    stats.zc_launches += launches;
+    stats.elements += rows * n;
+}
+
+void rmsnorm_npu_dev_bf16(const uint16_t *dx, const float *weight, uint16_t *dy, uint64_t rows, uint64_t N) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        kernel3_t &k = get_kernel3("rmsnorm_n" + std::to_string(N));
+        if (k.n != N || k.b != N) throw std::runtime_error("rmsnorm shape mismatch");
+        run_rows_dev(k, op_stats("rmsnorm"), dx, dy, rows, weight);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rmsnorm_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void rope_npu_dev_bf16(const uint16_t *dx, const float *lut, uint16_t *dy, uint64_t rows, uint64_t head_dim) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        kernel3_t &k = get_kernel3("rope_d" + std::to_string(head_dim));
+        if (k.n != head_dim || rows % k.m) {
+            throw std::runtime_error("rope: rows " + std::to_string(rows) + " not a multiple of compiled " +
+                                     std::to_string(k.m) + " (LUT repeats every m rows)");
+        }
+        run_rows_dev(k, op_stats("rope"), dx, dy, rows, lut);
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("rope_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
 #else
 static void zerocopy_unavailable() {
     OPENFISH_ERROR("%s", "zero-copy NPU ops need a rocm=1 npu=1 build");
@@ -1421,8 +1492,10 @@ void linear_npu_dev_bf16(const char *, const uint16_t *, uint16_t *, const float
 void silu_mul_npu_dev_bf16(const uint16_t *, const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
 void axpy_npu_dev_bf16(float, const uint16_t *, const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
 void silu_npu_dev_bf16(const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
-void rms_qkv_rope_npu_dev_bf16(const uint16_t *, const float *, const float *, const float *, uint16_t *, uint16_t *, uint64_t,
-                               uint64_t) {
+void rmsnorm_npu_dev_bf16(const uint16_t *, const float *, uint16_t *, uint64_t, uint64_t) { zerocopy_unavailable(); }
+void rope_npu_dev_bf16(const uint16_t *, const float *, uint16_t *, uint64_t, uint64_t) { zerocopy_unavailable(); }
+void rms_qkv_rope_npu_dev_bf16(const uint16_t *, const float *, const float *, const float *, uint16_t *, uint16_t *, uint16_t *,
+                               uint16_t *, uint64_t, uint64_t) {
     zerocopy_unavailable();
 }
 #endif

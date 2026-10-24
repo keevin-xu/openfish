@@ -231,10 +231,6 @@ void hip_copy_async(void *dst, const void *src, uint64_t bytes) {
     HIP_CHECK(hipMemcpyAsync(dst, src, bytes, hipMemcpyDefault, 0));
 }
 
-void hip_copy2d_async(void *dst, uint64_t dpitch, const void *src, uint64_t spitch, uint64_t width, uint64_t height) {
-    HIP_CHECK(hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, hipMemcpyDefault, 0));
-}
-
 void hip_memset_async(void *dst, int value, uint64_t bytes) {
     HIP_CHECK(hipMemsetAsync(dst, value, bytes, 0));
 }
