@@ -188,6 +188,7 @@ static std::vector<method_t> methods() {
 struct check_t {
     uint64_t bad = 0, sentinel = 0;
     double max_err = 0;
+    std::string first;  // the first few bad elements: index x y ref out
 };
 
 static check_t check(const std::vector<uint16_t> &out, uint64_t n, uint32_t seed, float alpha16) {
@@ -201,7 +202,14 @@ static check_t check(const std::vector<uint16_t> &out, uint64_t n, uint32_t seed
         const float x = bf2f(f2bf(pattern(i, seed))), y = bf2f(f2bf(pattern(i, seed ^ 0x00abcdefu)));
         const float ref = bf2f(f2bf(alpha16 * x + y));
         const double err = std::fabs((double)bf2f(out[i]) - ref);
-        if (!(err <= 1e-8 + 1e-2 * std::fabs(ref))) ++c.bad;  // the axpy Phase-1 gate (rtol 1e-2, atol 1e-8)
+        if (!(err <= 1e-8 + 1e-2 * std::fabs(ref))) {  // the axpy Phase-1 gate (rtol 1e-2, atol 1e-8)
+            if (c.bad < 4) {
+                char b[160];
+                snprintf(b, sizeof(b), " [i=%lu x=%g y=%g ref=%g out=%g]", (unsigned long)i, x, y, ref, bf2f(out[i]));
+                c.first += b;
+            }
+            ++c.bad;
+        }
         if (err > c.max_err || std::isnan(err)) c.max_err = std::isnan(err) ? INFINITY : err;
     }
     return c;
@@ -292,14 +300,15 @@ int main(int argc, char **argv) {
                 base_move += in + out;
                 base_kernel += k;
             }
-            if (it == iters) {
-                HIP_OK(hipMemcpy(host.data(), dout, bytes, hipMemcpyDeviceToHost));
-                const check_t c = check(host, n, seed, alpha16);
-                ok = c.bad == 0;
-                printf("baseline copy path: check %s (outside tol %lu, max abs err %.3g)\n", ok ? "PASS" : "FAIL",
-                       (unsigned long)c.bad, c.max_err);
+            HIP_OK(hipMemcpy(host.data(), dout, bytes, hipMemcpyDeviceToHost));
+            const check_t c = check(host, n, seed, alpha16);
+            if (c.bad) {
+                ok = false;
+                printf("baseline copy path iteration %d: outside tol %lu, max abs err %.3g:%s\n", it, (unsigned long)c.bad,
+                       c.max_err, c.first.c_str());
             }
         }
+        printf("baseline copy path: %d iterations checked, %s\n", iters + 1, ok ? "all PASS" : "FAIL");
         base_move /= iters;
         base_kernel /= iters;
         printf("baseline copy path: data movement %.2f ms, NPU kernel %.2f ms per launch (3 x %.1f MiB)\n\n", base_move,
@@ -363,10 +372,11 @@ int main(int argc, char **argv) {
                 HIP_OK(hipDeviceSynchronize());
                 HIP_OK(hipMemcpy(host.data(), dscratch, bytes, hipMemcpyDeviceToHost));
                 const check_t c = check(host, n, seed, alpha16);
+                if (c.bad) r.note += "round " + std::to_string(round) + ":" + c.first + "; ";
                 if (c.bad > worst.bad) worst = c;
                 if (c.max_err > worst.max_err) worst.max_err = c.max_err;
             }
-            const bool pass = worst.bad == 0;
+            bool pass = worst.bad == 0;
             r.result = pass ? "PASS" : "FAIL";
             char buf[256];
             snprintf(buf, sizeof(buf), "%d rounds: worst outside tol %lu/%lu, NPU result not seen %lu, max abs err %.3g%s",
@@ -374,7 +384,6 @@ int main(int argc, char **argv) {
                      sync_ok ? "" : "; bo.sync unsupported");
             r.note += buf;
             if (pass) {
-                any_pass = true;
                 // timing: everything between "iGPU finished writing" and "iGPU can read the result" except the kernel
                 double move = 0, kern = 0, gcopy = 0;
                 for (int it = 0; it < iters; ++it) {
@@ -396,11 +405,21 @@ int main(int argc, char **argv) {
                     copy16<<<grid, block>>>(o.dptr, dscratch, n);
                     HIP_OK(hipDeviceSynchronize());
                     gcopy += ms_since(t3);
+                    HIP_OK(hipMemcpy(host.data(), dscratch, bytes, hipMemcpyDeviceToHost));
+                    const check_t c = check(host, n, 5000 + it, alpha16);
+                    if (c.bad) {
+                        r.result = "FAIL";
+                        char b[96];
+                        snprintf(b, sizeof(b), "; timing iteration %d: outside tol %lu", it, (unsigned long)c.bad);
+                        r.note += b + c.first;
+                    }
                 }
                 r.move = move / iters;
                 r.kernel = kern / iters;
                 r.gpu_copy = gcopy / iters;
+                pass = r.result == "PASS";
             }
+            any_pass |= pass;
         } catch (const std::exception &e) {
             r.result = "FAIL";
             r.note = std::string("setup/run error: ") + e.what();
