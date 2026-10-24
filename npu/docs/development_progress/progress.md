@@ -180,3 +180,9 @@ comb12 119.4 → 105.4 s, bit-identical. Ledger R26 / D31.
 Zero-copy rms_qkv_rope does not work (the iGPU never sees the NPU's writes to the imported output buffers; wrong
 basecalls with the guard off). Residual (axpy) and FFN zero-copy are bit-identical on 3 reads; shared buffers are now
 allocated uncached on the iGPU by default. conv / rmsnorm / rope zero-copy implemented, not yet run. debug_log 2026-10-24.
+
+### 2026-10-24 — zero-copy done for all 12 NPU ops
+After the 2 MiB allocation fix (debug_log 2026-10-24), every op group runs zero-copy, bit-identical to the copy path on
+50 reads (group by group and as cumulative comb12 runs). comb12 with `OPENFISH_NPU_ZEROCOPY` = all ops: 86.9 s vs 119.4 s,
+peak RAM 6.66 → 2.43 GB, identity unchanged (−0.0018 vs iGPU-only 9.8 s). Remaining: NPU kernels 64.6 s, per-launch
+iGPU copies + syncs 11.9 s. Ledger R26 / D31.

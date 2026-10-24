@@ -36,3 +36,16 @@
 - Not the cause: the strided q|k|v copies (replaced by contiguous copies, same result); iGPU caching (uncached allocation, same result).
 - Same mechanism works for the GEMM ELFs (bit-identical over 2,304+ launches per run), silu_mul and axpy (bit-identical).
 - Next: standalone repro with this ELF (zero_copy_test-style: import one output at a time to find which arg breaks; try a larger/aligned buffer; check XRT logs for the patching of imported BOs).
+
+### 2026-10-24 (cont.) — zero-copy rms_qkv_rope: root cause = imported iGPU buffers under 2 MiB
+`npu/test/zero_copy_rqr_test.cpp` (logs `~/p0/zero_copy_rqr_test{,_b,_c,_d}.log`), rms_qkv_rope ELF, reference = host BOs:
+- hipMalloc does not sub-allocate (every allocation 256 KiB–64 MiB is its own, offset 0): not a dma-buf range problem.
+- One imported iGPU buffer (any of x, normed, v, q_roped, k_roped; 512 KiB or 64 MiB; cached or uncached): all outputs correct.
+- Two or more imported buffers of 512 KiB or 1 MiB: every imported output wrong (never written: still the 0xFF marker).
+  Fresh `xrt::run` or `set_arg` re-binding behave the same.
+- The same combinations with allocations of 2, 4 or 64 MiB: all correct.
+- Fix: `hip_shared_alloc` rounds sizes up to 2 MiB (openfish `round zero-copy shared allocations up to 2 MiB`). 3 reads:
+  zero-copy rms_qkv_rope bit-identical to the copy path, 18.7 → 13.8 s, guard 0 waits. The GEMM/silu_mul/axpy buffers
+  (4–64 MiB) were never affected; rope_d64 (1 MiB) would have been.
+- Likely a 2 MiB mapping granularity in the import of iGPU (VRAM) dma-bufs into the NPU's address space (driver side);
+  not isolated further. Worth reporting upstream (amdxdna / XRT) with this test.
