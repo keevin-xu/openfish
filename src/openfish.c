@@ -90,4 +90,18 @@ void openfish_rms_qkv_rope_npu_bf16(const uint16_t *in, const float *norm_weight
                                     uint16_t *normed, uint16_t *qkv, uint64_t n_rows, uint64_t seq_len) {
     rms_qkv_rope_npu_bf16(in, norm_weight, wqkv_weight, lut, normed, qkv, n_rows, seq_len);
 }
+int openfish_npu_zerocopy_enabled(const char *op) {
+    return npu_zerocopy_enabled(op);
+}
+void openfish_linear_npu_dev_bf16_f32(const char *op, const uint16_t *in, float *out, const float *weight, uint64_t n_rows,
+                                      uint64_t in_dim, uint64_t out_dim) {
+    linear_npu_dev_bf16_f32(op, in, out, weight, n_rows, in_dim, out_dim);
+}
+void openfish_linear_npu_dev_bf16(const char *op, const uint16_t *in, uint16_t *out, const float *weight, uint64_t n_rows,
+                                  uint64_t in_dim, uint64_t out_dim) {
+    linear_npu_dev_bf16(op, in, out, weight, n_rows, in_dim, out_dim);
+}
+void openfish_silu_mul_npu_dev_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *out, uint64_t n) {
+    silu_mul_npu_dev_bf16(gate, up, out, n);
+}
 #endif

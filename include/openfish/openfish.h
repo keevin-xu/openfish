@@ -215,6 +215,15 @@ void openfish_silu_npu_bf16(const uint16_t *in, uint16_t *out, uint64_t n);
 void openfish_rms_qkv_rope_npu_bf16(const uint16_t *in, const float *norm_weight, const float *wqkv_weight, const float *lut,
                                     uint16_t *normed, uint16_t *qkv, uint64_t n_rows, uint64_t seq_len);
 
+// Zero-copy iGPU <-> NPU (rocm=1 npu=1 builds): in/out pointers are iGPU memory, nothing passes through the host.
+// Enabled per op by OPENFISH_NPU_ZEROCOPY (comma list or "all").
+int openfish_npu_zerocopy_enabled(const char *op);
+void openfish_linear_npu_dev_bf16_f32(const char *op, const uint16_t *in, float *out, const float *weight, uint64_t n_rows,
+                                      uint64_t in_dim, uint64_t out_dim);
+void openfish_linear_npu_dev_bf16(const char *op, const uint16_t *in, uint16_t *out, const float *weight, uint64_t n_rows,
+                                  uint64_t in_dim, uint64_t out_dim);
+void openfish_silu_mul_npu_dev_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *out, uint64_t n);
+
 #endif // HAVE_NPU
 
 #ifdef __cplusplus

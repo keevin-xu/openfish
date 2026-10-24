@@ -2,6 +2,7 @@
 #include "error.h"
 #include "nn_kernel_hip.h"
 #include "hip_utils.h"
+#include "nn_hip_shared.h"
 
 #include <openfish/openfish_error.h>
 
@@ -187,4 +188,37 @@ void openfish_rotary_emb_gpu(
     checkHipError();
     ret = hipDeviceSynchronize();
     checkHipError(); HIP_CHECK(ret);
+}
+
+// ---- zero-copy iGPU <-> NPU buffers (nn_hip_shared.h; used by nn_npu.cpp)
+
+int hip_shared_alloc(uint64_t bytes, void **dptr, int *dmabuf_fd) {
+    const uint64_t size = (bytes + 4095) / 4096 * 4096;
+    hipError_t ret = hipMalloc(dptr, size);
+    if (ret != hipSuccess) {
+        fprintf(stderr, "hip_shared_alloc: hipMalloc(%lu): %s\n", (unsigned long)size, hipGetErrorString(ret));
+        *dptr = NULL;
+        return -1;
+    }
+    int fd = -1;
+    ret = hipMemGetHandleForAddressRange(&fd, (hipDeviceptr_t)*dptr, size, hipMemRangeHandleTypeDmaBufFd, 0);
+    if (ret != hipSuccess) {
+        fprintf(stderr, "hip_shared_alloc: dma-buf export: %s\n", hipGetErrorString(ret));
+        (void)hipFree(*dptr);
+        *dptr = NULL;
+        return -1;
+    }
+    *dmabuf_fd = fd;
+    return 0;
+}
+
+void hip_copy_sync(void *dst, const void *src, uint64_t bytes) {
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpy(dst, src, bytes, hipMemcpyDefault));
+    HIP_CHECK(hipDeviceSynchronize());
+}
+
+void hip_memset_sync(void *dst, int value, uint64_t bytes) {
+    HIP_CHECK(hipMemset(dst, value, bytes));
+    HIP_CHECK(hipDeviceSynchronize());
 }

@@ -17,6 +17,9 @@
 
 #include "nn_npu.h"
 #include "npu_bfp16_pack.h"
+#ifdef HAVE_ROCM
+#include "nn_hip_shared.h"
+#endif
 
 #include <openfish/openfish_error.h>
 
@@ -140,6 +143,7 @@ struct npu_stats_t {
     double t_out = 0;     // sync from device + bf16->f32
     uint64_t guard_retried = 0, guard_polls = 0, guard_timeouts = 0;  // stale-output guard (below)
     double guard_wait = 0;
+    uint64_t zc_launches = 0;  // launches that took the zero-copy path
 };
 
 // Stale-output guard (development_progress/debug_log.md 2026-10-24): after run.wait() + bo.sync(FROM_DEVICE), the
@@ -202,6 +206,15 @@ void guard_wait(xrt::bo &bo, const void *map, uint64_t bytes, uint64_t elem_byte
     stats.guard_wait += seconds_since(t0);
 }
 
+// Zero-copy iGPU <-> NPU buffer (porting_targets.md B1; npu/test/zero_copy_test.cpp method D): iGPU memory
+// (hipMalloc in nn_hip.c) exported as a dma-buf and imported into XRT, so iGPU copies and the NPU kernel use the same
+// physical pages and nothing passes through host memory. One per (kernel, role), allocated on first use, kept.
+struct shared_buf_t {
+    void *dptr = nullptr;  // iGPU address
+    uint64_t bytes = 0;
+    xrt::bo bo;            // the same pages as an NPU buffer object
+};
+
 // One compiled 3-tensor elementwise kernel (in0, in1, out), resident for the process lifetime.
 struct elementwise_kernel_t {
     std::string name;
@@ -215,6 +228,7 @@ struct elementwise_kernel_t {
     // template overload and fails with "patch_value() only supports 64-bit values".
     xrt::bo bo_in0, bo_in1, bo_out;
     uint16_t *in0 = nullptr, *in1 = nullptr, *out = nullptr;
+    shared_buf_t zc_in0, zc_in1, zc_out;  // zero-copy path
     xrt::run run;
     npu_stats_t stats;
 
@@ -259,6 +273,7 @@ struct gemm_kernel_t {
     uint16_t *a = nullptr;
     float *c32 = nullptr;
     uint16_t *c16 = nullptr;
+    shared_buf_t zc_a, zc_c32, zc_c16;  // zero-copy path
     xrt::run run;
     std::unordered_map<const float *, xrt::bo> weights;
     npu_stats_t stats;
@@ -315,10 +330,10 @@ void print_stats() {
         }
         fprintf(stderr,
                 "[nn_npu] %s: %lu calls, %lu launches, %lu elements; host in %.3f s, kernel %.3f s (%.1f ms/launch), host out %.3f s; "
-                "stale-output guard: %lu launches waited (%lu re-syncs, %.4f s, %lu timeouts)\n",
+                "stale-output guard: %lu launches waited (%lu re-syncs, %.4f s, %lu timeouts); zero-copy launches %lu\n",
                 it.first.c_str(), (unsigned long)s.calls, (unsigned long)s.launches, (unsigned long)s.elements, s.t_in,
                 s.t_kernel, 1e3 * s.t_kernel / std::max<uint64_t>(s.launches, 1), s.t_out, (unsigned long)s.guard_retried,
-                (unsigned long)s.guard_polls, s.guard_wait, (unsigned long)s.guard_timeouts);
+                (unsigned long)s.guard_polls, s.guard_wait, (unsigned long)s.guard_timeouts, (unsigned long)s.zc_launches);
     }
 }
 
@@ -506,63 +521,84 @@ int npu_op_enabled(const char *op) {
     return std::find(ops.begin(), ops.end(), op) != ops.end();
 }
 
+// The GEMM kernel for K x N, the op's stats and its resident weight bound as arg 1 (caller holds g_mutex).
+static gemm_kernel_t &gemm_prepare(const char *op, const float *weight, uint64_t K, uint64_t N, npu_stats_t *&stats_out) {
+    const std::string key = std::to_string(K) + "x" + std::to_string(N);
+    auto it = g_gemm.find(key);
+    if (it == g_gemm.end()) {
+        it = g_gemm.emplace(key, load_gemm(op, K, N)).first;
+    }
+    gemm_kernel_t &g = *it->second;
+    auto st = g_op_stats.find(op);
+    if (st == g_op_stats.end()) {
+        st = g_op_stats.emplace(op, npu_stats_t()).first;
+        g_stats.emplace_back(op, &st->second);
+    }
+    npu_stats_t &stats = st->second;
+    if (g.k != K || g.n != N) {
+        throw std::runtime_error(std::string(op) + ": runtime shape " + std::to_string(K) + "x" + std::to_string(N) +
+                                 " != compiled " + std::to_string(g.k) + "x" + std::to_string(g.n));
+    }
+
+    auto t0 = clock_type::now();
+    auto w = g.weights.find(weight);
+    if (w == g.weights.end() && g.method == "bfp16w") {
+        // B[k, n] = weight[n, k].T rounded to bf16, then bfp16ebs8-packed (example pack_b_bfp16ebs8), resident
+        std::vector<float> wr(K * N);
+        parallel_for(K * N, g_threads, [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) wr[i] = bf16_to_f32(f32_to_bf16(weight[i]));
+        });
+        const uint64_t nb = N / g.tile_n;
+        xrt::bo bo_b = xrt::ext::bo(g.device, nb * (K / g.tile_k_l1) * npu_bfp16::tile_bytes(g.tile_n, g.tile_k_l1));
+        uint8_t *b = bo_b.map<uint8_t *>();
+        parallel_for(nb, std::min<int>(g_threads, (int)nb), [&](uint64_t lo, uint64_t hi) {
+            npu_bfp16::pack_weight(wr.data(), N, K, g.tile_n, g.tile_k_l1, b, lo, hi);
+        });
+        bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        w = g.weights.emplace(weight, bo_b).first;
+    }
+    if (w == g.weights.end()) {
+        // B[k, n] = weight[n, k].T, bf16, resident for the process lifetime
+        xrt::bo bo_b = xrt::ext::bo(g.device, K * N * sizeof(uint16_t));
+        uint16_t *b = bo_b.map<uint16_t *>();
+        parallel_for(K, g_threads, [&](uint64_t lo, uint64_t hi) {
+            for (uint64_t i = lo; i < hi; ++i) {
+                for (uint64_t j = 0; j < N; ++j) {
+                    b[i * N + j] = f32_to_bf16(weight[j * K + i]);
+                }
+            }
+        });
+        bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        w = g.weights.emplace(weight, bo_b).first;
+    }
+    g.run.set_arg(1, w->second);
+    stats.t_in += seconds_since(t0);
+    stats_out = &stats;
+    return g;
+}
+
+// Bind the host-mapped A and C buffers (the zero-copy path rebinds them to shared buffers for its calls).
+static void gemm_bind_host(gemm_kernel_t &g) {
+    g.run.set_arg(0, g.bo_a);
+    if (g.method == "bfp16w") {
+        g.run.set_arg(2, g.bo_c16);
+        return;
+    }
+    g.run.set_arg(2, g.bo_c32);
+    if (g.method == "fused-cast") g.run.set_arg(3, g.bo_c16);
+}
+
 template <typename In, typename Out>
 static void linear_impl(const char *op, const In *x, Out *out, const float *weight, uint64_t rows, uint64_t K, uint64_t N) {
     std::lock_guard<std::mutex> guard(g_mutex);
     try {
-        const std::string key = std::to_string(K) + "x" + std::to_string(N);
-        auto it = g_gemm.find(key);
-        if (it == g_gemm.end()) {
-            it = g_gemm.emplace(key, load_gemm(op, K, N)).first;
-        }
-        gemm_kernel_t &g = *it->second;
-        auto st = g_op_stats.find(op);
-        if (st == g_op_stats.end()) {
-            st = g_op_stats.emplace(op, npu_stats_t()).first;
-            g_stats.emplace_back(op, &st->second);
-        }
-        npu_stats_t &stats = st->second;
-        if (g.k != K || g.n != N) {
-            throw std::runtime_error(std::string(op) + ": runtime shape " + std::to_string(K) + "x" + std::to_string(N) +
-                                     " != compiled " + std::to_string(g.k) + "x" + std::to_string(g.n));
-        }
-
-        auto t0 = clock_type::now();
-        auto w = g.weights.find(weight);
-        if (w == g.weights.end() && g.method == "bfp16w") {
-            // B[k, n] = weight[n, k].T rounded to bf16, then bfp16ebs8-packed (example pack_b_bfp16ebs8), resident
-            std::vector<float> wr(K * N);
-            parallel_for(K * N, g_threads, [&](uint64_t lo, uint64_t hi) {
-                for (uint64_t i = lo; i < hi; ++i) wr[i] = bf16_to_f32(f32_to_bf16(weight[i]));
-            });
-            const uint64_t nb = N / g.tile_n;
-            xrt::bo bo_b = xrt::ext::bo(g.device, nb * (K / g.tile_k_l1) * npu_bfp16::tile_bytes(g.tile_n, g.tile_k_l1));
-            uint8_t *b = bo_b.map<uint8_t *>();
-            parallel_for(nb, std::min<int>(g_threads, (int)nb), [&](uint64_t lo, uint64_t hi) {
-                npu_bfp16::pack_weight(wr.data(), N, K, g.tile_n, g.tile_k_l1, b, lo, hi);
-            });
-            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            w = g.weights.emplace(weight, bo_b).first;
-        }
-        if (w == g.weights.end()) {
-            // B[k, n] = weight[n, k].T, bf16, resident for the process lifetime
-            xrt::bo bo_b = xrt::ext::bo(g.device, K * N * sizeof(uint16_t));
-            uint16_t *b = bo_b.map<uint16_t *>();
-            parallel_for(K, g_threads, [&](uint64_t lo, uint64_t hi) {
-                for (uint64_t i = lo; i < hi; ++i) {
-                    for (uint64_t j = 0; j < N; ++j) {
-                        b[i * N + j] = f32_to_bf16(weight[j * K + i]);
-                    }
-                }
-            });
-            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            w = g.weights.emplace(weight, bo_b).first;
-        }
-        g.run.set_arg(1, w->second);
+        npu_stats_t *sp = nullptr;
+        gemm_kernel_t &g = gemm_prepare(op, weight, K, N, sp);
+        npu_stats_t &stats = *sp;
+        gemm_bind_host(g);
 
         const uint64_t m = g.m;
         const uint64_t launches = (rows + m - 1) / m;
-        stats.t_in += seconds_since(t0);
         for (uint64_t l = 0; l < launches; ++l) {
             const uint64_t begin = l * m;
             const uint64_t count = std::min(m, rows - begin);
@@ -1048,6 +1084,216 @@ void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *
 }
 
 // float32 host I/O (CPU build) and bf16 host I/O (iGPU build: tensors cast fp16 -> bf16 on the GPU)
+// ---- zero-copy iGPU <-> NPU (porting_targets.md B1): device-pointer variants of the NPU ops. Inputs and outputs are
+// iGPU memory; per launch the iGPU copies the launch's rows into the kernel's shared input buffer and the result out of
+// its shared output buffer (device-to-device), so nothing passes through host memory. Enabled per op by
+// OPENFISH_NPU_ZEROCOPY (comma list or "all"); rocm=1 npu=1 builds only.
+
+int npu_zerocopy_enabled(const char *op) {
+    static const std::vector<std::string> ops = [] {
+        std::vector<std::string> v;
+        const char *env = std::getenv("OPENFISH_NPU_ZEROCOPY");
+        std::stringstream ss(env ? env : "");
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) v.push_back(item);
+        }
+#ifdef HAVE_ROCM
+        if (!v.empty()) fprintf(stderr, "[nn_npu] zero-copy iGPU<->NPU for: %s\n", env);
+#else
+        if (!v.empty()) fprintf(stderr, "[nn_npu] OPENFISH_NPU_ZEROCOPY ignored: not a rocm=1 build\n");
+        v.clear();
+#endif
+        return v;
+    }();
+    return std::find(ops.begin(), ops.end(), "all") != ops.end() || std::find(ops.begin(), ops.end(), op) != ops.end();
+}
+
+#ifdef HAVE_ROCM
+namespace {
+
+void shared_ensure(shared_buf_t &s, xrt::device &device, uint64_t bytes) {
+    if (s.dptr) {
+        if (s.bytes < bytes) throw std::runtime_error("zero-copy buffer too small");
+        return;
+    }
+    int fd = -1;
+    if (hip_shared_alloc(bytes, &s.dptr, &fd) != 0) {
+        throw std::runtime_error("zero-copy: iGPU allocation / dma-buf export failed");
+    }
+    s.bo = xrt::bo(device, xrt::pid_type{getpid()}, static_cast<xrt::bo::export_handle>(fd));
+    s.bytes = bytes;
+}
+
+// Stale-output guard for a shared output: the marker is written and the tail read back by the iGPU.
+void guard_arm_dev(shared_buf_t &s, uint64_t bytes) {
+    if (!guard_on()) return;
+    const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
+    hip_memset_sync(static_cast<uint8_t *>(s.dptr) + off, 0xFF, g);
+}
+
+void guard_wait_dev(shared_buf_t &s, uint64_t bytes, uint64_t elem_bytes, npu_stats_t &stats) {
+    if (!guard_on()) return;
+    const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
+    uint8_t tail[kGuardBytes];
+    hip_copy_sync(tail, static_cast<uint8_t *>(s.dptr) + off, g);
+    if (!guard_marked(tail, g, elem_bytes)) return;
+    auto t0 = clock_type::now();
+    stats.guard_retried += 1;
+    while (guard_marked(tail, g, elem_bytes)) {
+        if (seconds_since(t0) > kGuardTimeout) {
+            stats.guard_timeouts += 1;
+            break;
+        }
+        s.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, g, off);
+        hip_copy_sync(tail, static_cast<uint8_t *>(s.dptr) + off, g);
+        stats.guard_polls += 1;
+    }
+    stats.guard_wait += seconds_since(t0);
+}
+
+}  // namespace
+
+// out[rows, N] = x[rows, K] @ weight[N, K].T with x (bf16) and out (Out) in iGPU memory.
+template <typename Out>
+static void linear_dev_impl(const char *op, const uint16_t *dx, Out *dout, const float *weight, uint64_t rows, uint64_t K,
+                            uint64_t N) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        constexpr bool f32 = std::is_same<Out, float>::value;
+        npu_stats_t *sp = nullptr;
+        gemm_kernel_t &g = gemm_prepare(op, weight, K, N, sp);
+        npu_stats_t &stats = *sp;
+        if (f32 ? !g.c32 : !g.c16) {
+            throw std::runtime_error(f32 ? "f32 output requested but the GEMM ELF is bfp16w (unset OPENFISH_NPU_GEMM_OUT)"
+                                         : "bf16 output requested but the GEMM ELF is f32-out (set OPENFISH_NPU_GEMM_OUT=f32)");
+        }
+        const uint64_t m = g.m, eb = sizeof(Out);
+        shared_ensure(g.zc_a, g.device, m * K * sizeof(uint16_t));
+        shared_buf_t &zo = f32 ? g.zc_c32 : g.zc_c16;
+        shared_ensure(zo, g.device, m * N * eb);
+        gemm_bind_host(g);  // the output this call does not read stays host-mapped (fused-cast has both)
+        g.run.set_arg(0, g.zc_a.bo);
+        g.run.set_arg(f32 || g.method == "bfp16w" ? 2 : 3, zo.bo);
+
+        const uint64_t launches = (rows + m - 1) / m;
+        for (uint64_t l = 0; l < launches; ++l) {
+            const uint64_t begin = l * m;
+            const uint64_t count = std::min(m, rows - begin);
+            auto t1 = clock_type::now();
+            hip_copy_sync(g.zc_a.dptr, dx + begin * K, count * K * sizeof(uint16_t));
+            if (count < m) {
+                hip_memset_sync(static_cast<uint8_t *>(g.zc_a.dptr) + count * K * sizeof(uint16_t), 0,
+                                (m - count) * K * sizeof(uint16_t));
+            }
+            g.zc_a.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            guard_arm_dev(zo, m * N * eb);
+            auto t2 = clock_type::now();
+            g.run.start();
+            if (g.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+                throw std::runtime_error(std::string(op) + " launch timed out after 60 s");
+            }
+            auto t3 = clock_type::now();
+            zo.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            guard_wait_dev(zo, m * N * eb, eb, stats);
+            hip_copy_sync(dout + begin * N, zo.dptr, count * N * eb);
+            auto t4 = clock_type::now();
+            stats.t_in += std::chrono::duration<double>(t2 - t1).count();
+            stats.t_kernel += std::chrono::duration<double>(t3 - t2).count();
+            stats.t_out += std::chrono::duration<double>(t4 - t3).count();
+        }
+        gemm_bind_host(g);
+        stats.calls += 1;
+        stats.launches += launches;
+        stats.zc_launches += launches;
+        stats.elements += rows * N;
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("linear_npu_dev(%s): %s", op, e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+// silu_mul with gate, up and out (bf16, total elements each) in iGPU memory; kernel args (gate, up, out).
+static void silu_mul_dev_impl(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    try {
+        if (!g_silu_mul) {
+            g_silu_mul = load_silu_mul();
+        }
+        elementwise_kernel_t &k = *g_silu_mul;
+        const uint64_t n = k.n, bytes = n * sizeof(uint16_t);
+        shared_ensure(k.zc_in0, k.device, bytes);
+        shared_ensure(k.zc_in1, k.device, bytes);
+        shared_ensure(k.zc_out, k.device, bytes);
+        k.run.set_arg(0, k.zc_in0.bo);
+        k.run.set_arg(1, k.zc_in1.bo);
+        k.run.set_arg(2, k.zc_out.bo);
+        const uint64_t launches = (total + n - 1) / n;
+        for (uint64_t l = 0; l < launches; ++l) {
+            const uint64_t begin = l * n;
+            const uint64_t count = std::min(n, total - begin);
+            auto t0 = clock_type::now();
+            hip_copy_sync(k.zc_in0.dptr, dgate + begin, count * sizeof(uint16_t));
+            hip_copy_sync(k.zc_in1.dptr, dup + begin, count * sizeof(uint16_t));
+            if (count < n) {
+                hip_memset_sync(static_cast<uint16_t *>(k.zc_in0.dptr) + count, 0, (n - count) * sizeof(uint16_t));
+                hip_memset_sync(static_cast<uint16_t *>(k.zc_in1.dptr) + count, 0, (n - count) * sizeof(uint16_t));
+            }
+            k.zc_in0.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k.zc_in1.bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            guard_arm_dev(k.zc_out, bytes);
+            auto t1 = clock_type::now();
+            k.run.start();
+            if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
+                throw std::runtime_error("silu_mul launch timed out after 60 s");
+            }
+            auto t2 = clock_type::now();
+            k.zc_out.bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            guard_wait_dev(k.zc_out, bytes, 2, k.stats);
+            hip_copy_sync(dout + begin, k.zc_out.dptr, count * sizeof(uint16_t));
+            auto t3 = clock_type::now();
+            k.stats.t_in += std::chrono::duration<double>(t1 - t0).count();
+            k.stats.t_kernel += std::chrono::duration<double>(t2 - t1).count();
+            k.stats.t_out += std::chrono::duration<double>(t3 - t2).count();
+        }
+        k.run.set_arg(0, k.bo_in0);
+        k.run.set_arg(1, k.bo_in1);
+        k.run.set_arg(2, k.bo_out);
+        k.stats.calls += 1;
+        k.stats.launches += launches;
+        k.stats.zc_launches += launches;
+        k.stats.elements += total;
+    } catch (const std::exception &e) {
+        OPENFISH_ERROR("silu_mul_npu_dev: %s", e.what());
+        exit(EXIT_FAILURE);
+    }
+}
+
+void linear_npu_dev_bf16_f32(const char *op, const uint16_t *dx, float *dout, const float *w, uint64_t rows, uint64_t K,
+                             uint64_t N) {
+    linear_dev_impl(op, dx, dout, w, rows, K, N);
+}
+void linear_npu_dev_bf16(const char *op, const uint16_t *dx, uint16_t *dout, const float *w, uint64_t rows, uint64_t K,
+                         uint64_t N) {
+    linear_dev_impl(op, dx, dout, w, rows, K, N);
+}
+void silu_mul_npu_dev_bf16(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total) {
+    silu_mul_dev_impl(dgate, dup, dout, total);
+}
+#else
+static void zerocopy_unavailable() {
+    OPENFISH_ERROR("%s", "zero-copy NPU ops need a rocm=1 npu=1 build");
+    exit(EXIT_FAILURE);
+}
+void linear_npu_dev_bf16_f32(const char *, const uint16_t *, float *, const float *, uint64_t, uint64_t, uint64_t) {
+    zerocopy_unavailable();
+}
+void linear_npu_dev_bf16(const char *, const uint16_t *, uint16_t *, const float *, uint64_t, uint64_t, uint64_t) {
+    zerocopy_unavailable();
+}
+void silu_mul_npu_dev_bf16(const uint16_t *, const uint16_t *, uint16_t *, uint64_t) { zerocopy_unavailable(); }
+#endif
+
 void silu_mul_npu(const float *x, float *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
 void silu_mul_npu_bf16(const uint16_t *x, uint16_t *o, uint64_t MN, uint64_t K) { silu_mul_impl(x, o, MN, K); }
 void linear_npu(const char *op, const float *x, float *out, const float *w, uint64_t rows, uint64_t K, uint64_t N) {

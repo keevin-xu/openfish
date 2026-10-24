@@ -41,6 +41,15 @@ void silu_npu_bf16(const uint16_t *x, uint16_t *out, uint64_t n);
 void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *wqkv, const float *lut, uint16_t *normed,
                            uint16_t *qkv, uint64_t rows, uint64_t T);
 
+// Zero-copy iGPU <-> NPU (rocm=1 npu=1): device-pointer (iGPU memory) variants; OPENFISH_NPU_ZEROCOPY = ops or "all"
+int npu_zerocopy_enabled(const char *op);
+void linear_npu_dev_bf16_f32(const char *op, const uint16_t *dx, float *dout, const float *weight, uint64_t rows, uint64_t K,
+                             uint64_t N);
+void linear_npu_dev_bf16(const char *op, const uint16_t *dx, uint16_t *dout, const float *weight, uint64_t rows, uint64_t K,
+                         uint64_t N);
+// gate, up, out: total bf16 elements each (rows of [y | gate] already split on the iGPU)
+void silu_mul_npu_dev_bf16(const uint16_t *dgate, const uint16_t *dup, uint16_t *dout, uint64_t total);
+
 #ifdef __cplusplus
 }
 #endif
