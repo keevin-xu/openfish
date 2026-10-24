@@ -194,11 +194,14 @@ void openfish_rotary_emb_gpu(
 
 // ---- zero-copy iGPU <-> NPU buffers (nn_hip_shared.h; used by nn_npu.cpp)
 
-// Uncached by default: the NPU's writes do not invalidate the iGPU's caches, so an iGPU read of a cached line after an
-// NPU write returns stale data (seen with the 512 KiB rms_qkv_rope outputs). OPENFISH_NPU_ZC_ALLOC=cached uses plain
-// hipMalloc, =finegrained hipDeviceMallocFinegrained (for comparison).
+// Sizes are rounded up to 2 MiB: with two or more imported iGPU buffers under 2 MiB bound to one NPU kernel, the
+// NPU's writes do not reach them (npu/test/zero_copy_rqr_test.cpp; >= 2 MiB every combination works).
+// Allocated uncached on the iGPU (hipDeviceMallocUncached): the NPU's writes do not invalidate iGPU caches, so this
+// keeps a stale cached line from ever being read. OPENFISH_NPU_ZC_ALLOC=cached uses plain hipMalloc, =finegrained
+// hipDeviceMallocFinegrained (for comparison).
 int hip_shared_alloc(uint64_t bytes, void **dptr, int *dmabuf_fd) {
-    const uint64_t size = (bytes + 4095) / 4096 * 4096;
+    const uint64_t granule = 2ull << 20;
+    const uint64_t size = (bytes + granule - 1) / granule * granule;
     const char *mode = getenv("OPENFISH_NPU_ZC_ALLOC");
     hipError_t ret;
     if (mode && strcmp(mode, "cached") == 0) {
