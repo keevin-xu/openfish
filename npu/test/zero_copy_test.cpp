@@ -265,7 +265,10 @@ int main(int argc, char **argv) {
         }
     };
 
-    // ---- baseline: the copy path the slorado hooks + nn_npu.cpp use today
+    // ---- baseline: the copy path the slorado hooks + nn_npu.cpp use today. Variants diagnose stale output:
+    //   plain       wait -> bo.sync(FROM_DEVICE) -> memcpy from the BO map (what nn_npu.cpp does)
+    //   delay       the same with a 2 ms sleep after wait, before the sync (tests "wait returns before the last DMA")
+    //   resync      sync, 2 ms sleep, sync again, then memcpy (tests a stale CPU cache after the first sync)
     double base_move = 0, base_kernel = 0;
     {
         uint16_t *dx = nullptr, *dy = nullptr, *dout = nullptr;
@@ -275,42 +278,56 @@ int main(int argc, char **argv) {
         std::vector<uint16_t> hx(n), hy(n), hout(n);
         xrt::bo bx = xrt::ext::bo(dev, bytes), by = xrt::ext::bo(dev, bytes), bo = xrt::ext::bo(dev, bytes);
         auto *mx = bx.map<uint16_t *>(), *my = by.map<uint16_t *>(), *mo = bo.map<uint16_t *>();
-        bool ok = true;
-        for (int it = 0; it < iters + 1; ++it) {
-            const uint32_t seed = 1000 + it;
-            fill<<<grid, block>>>(dx, dy, dout, n, seed);
-            HIP_OK(hipDeviceSynchronize());
-            auto t0 = clock_type::now();
-            HIP_OK(hipMemcpy(hx.data(), dx, bytes, hipMemcpyDeviceToHost));
-            HIP_OK(hipMemcpy(hy.data(), dy, bytes, hipMemcpyDeviceToHost));
-            std::memcpy(mx, hx.data(), bytes);
-            std::memcpy(my, hy.data(), bytes);
-            bx.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            by.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            const double in = ms_since(t0);
-            auto t1 = clock_type::now();
-            npu_run(bx, by, bo);
-            const double k = ms_since(t1);
-            auto t2 = clock_type::now();
-            bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            std::memcpy(hout.data(), mo, bytes);
-            HIP_OK(hipMemcpy(dout, hout.data(), bytes, hipMemcpyHostToDevice));
-            const double out = ms_since(t2);
-            if (it > 0) {  // the first iteration warms up
-                base_move += in + out;
-                base_kernel += k;
+        const char *variants[] = {"plain", "delay", "resync"};
+        for (int v = 0; v < 3; ++v) {
+            int failed = 0;
+            uint64_t bad_total = 0;
+            std::string first;
+            double move = 0, kern = 0;
+            for (int it = 0; it < iters + 1; ++it) {
+                const uint32_t seed = 1000 + 100 * v + it;
+                fill<<<grid, block>>>(dx, dy, dout, n, seed);
+                HIP_OK(hipDeviceSynchronize());
+                auto t0 = clock_type::now();
+                HIP_OK(hipMemcpy(hx.data(), dx, bytes, hipMemcpyDeviceToHost));
+                HIP_OK(hipMemcpy(hy.data(), dy, bytes, hipMemcpyDeviceToHost));
+                std::memcpy(mx, hx.data(), bytes);
+                std::memcpy(my, hy.data(), bytes);
+                bx.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                by.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                const double in = ms_since(t0);
+                auto t1 = clock_type::now();
+                npu_run(bx, by, bo);
+                const double k = ms_since(t1);
+                if (v == 1) usleep(2000);
+                auto t2 = clock_type::now();
+                bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                if (v == 2) {
+                    usleep(2000);
+                    bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                }
+                std::memcpy(hout.data(), mo, bytes);
+                HIP_OK(hipMemcpy(dout, hout.data(), bytes, hipMemcpyHostToDevice));
+                const double out = ms_since(t2);
+                if (v == 0 && it > 0) {  // the first iteration warms up; only the plain path is timed
+                    move += in + out;
+                    kern += k;
+                }
+                HIP_OK(hipMemcpy(host.data(), dout, bytes, hipMemcpyDeviceToHost));
+                const check_t c = check(host, n, seed, alpha16);
+                if (c.bad) {
+                    ++failed;
+                    bad_total += c.bad;
+                    if (first.empty()) first = "iteration " + std::to_string(it) + ":" + c.first;
+                }
             }
-            HIP_OK(hipMemcpy(host.data(), dout, bytes, hipMemcpyDeviceToHost));
-            const check_t c = check(host, n, seed, alpha16);
-            if (c.bad) {
-                ok = false;
-                printf("baseline copy path iteration %d: outside tol %lu, max abs err %.3g:%s\n", it, (unsigned long)c.bad,
-                       c.max_err, c.first.c_str());
+            printf("baseline copy path, %-6s: %d/%d launches with wrong output (%lu elements in all)%s%s\n", variants[v], failed,
+                   iters + 1, (unsigned long)bad_total, failed ? "; first: " : "", first.c_str());
+            if (v == 0) {
+                base_move = move / iters;
+                base_kernel = kern / iters;
             }
         }
-        printf("baseline copy path: %d iterations checked, %s\n", iters + 1, ok ? "all PASS" : "FAIL");
-        base_move /= iters;
-        base_kernel /= iters;
         printf("baseline copy path: data movement %.2f ms, NPU kernel %.2f ms per launch (3 x %.1f MiB)\n\n", base_move,
                base_kernel, bytes / 1048576.0);
         (void)hipFree(dx);
