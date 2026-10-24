@@ -21,9 +21,9 @@ wqkv, out_proj, upsample, crf, rmsnorm, rope, conv (im2col + GEMM).
 | A3 | EXAMPLE + MOD | out_proj → residual add → FFN. **Mod:** insert an RMSNorm after the add; scale the residual by α = 2.449 (deepnorm) | `llms/shared/builders/o_ffn_multi.py` | out_proj + norm1 + GatedMLP | not started |
 | A4 | EXAMPLE + MOD | Windowed attention. **Mod:** the example only skips causal (future) blocks; change the skip rule to a ±127/128 band (~5 of 16 K-blocks per Q-block). The `dataflow_based` variant's mask argument is declared but never read, so it cannot be used as-is | `flash_attention/kernel_fusion_based/attn_npu2_seqfirst.py` | MHA SDPA | not started |
 | A5 | EXAMPLE | GEMM with fp32 output (replaces our fused-cast GEMM; should recover the accuracy lost by returning bf16) | `matrix_multiplication/bf16_in_fp32_out` | all GEMM call sites | **done 10-23**: `kernels/gemm_f32out` + `OPENFISH_NPU_GEMM_OUT=f32`. Native build Phase 1 PASS (6/6), bfp16 FAIL (as R15). 50 reads, 7 GEMM ops: native −0.0012 (90.3 s), bfp16 −0.0193 (45.0 s; same identity as fused-cast + f32 return, 6% faster) |
-| A6 | EXAMPLE | GEMM with bfp16 pre-converted weights (between the lossy bfp16 build and the slow native build) | `matrix_multiplication/bf16_x_bfp16` | all GEMM call sites | **done 10-23, partial**: `kernels/gemm_bfp16w` + C++ packer (`src/npu_bfp16_pack.h`). Phase 1 PASS 6/6 (example gate). 50 reads: 6 transformer/tail GEMMs −0.0012 (36.1 s); **conv: no alignments** — the example's packer truncates (75–80% of weights move down, none up: −1.0…−1.6% per-channel weight-sum shift), which the conv stack's non-negative inputs accumulate. Rounding packer = hand-coded fix |
+| A6 → D1 | EXAMPLE | GEMM with bfp16 pre-converted weights (between the lossy bfp16 build and the slow native build) | `matrix_multiplication/bf16_x_bfp16` | all GEMM call sites | **done 10-23, partial**: `kernels/gemm_bfp16w` + C++ packer (`src/npu_bfp16_pack.h`). Phase 1 PASS 6/6 (example gate). 50 reads: 6 transformer/tail GEMMs −0.0012 (36.1 s); **conv: no alignments** — the example's packer truncates (75–80% of weights move down, none up: −1.0…−1.6% per-channel weight-sum shift), which the conv stack's non-negative inputs accumulate. Rounding packer = hand-coded fix |
 | A7 | EXAMPLE | Deepnorm residual α·x + y | `axpy` | `run_norm` residual (folded on the iGPU today) | **done 10-23**: `kernels/axpy`, op `residual`. Phase 1 FAIL at the example's rtol 1e-2 vs true alpha (alpha is a bf16 constant, 2.453125 vs 2.4494897); PASS vs bf16(alpha). 50 reads: −0.0012, 16.6 s |
-| A8 | EXAMPLE | Conv-stack swish | `silu` | `ConvStack` activations | **done 10-23, fails end to end**: `kernels/silu`, op `swish`. Phase 1 PASS at the example's tol (atol 0.05), but the tanh-based SiLU flushes x < −6 to 0 and is biased up to ~10% on [−5, −2]; 50 reads: 11/50 reads align. bf16 conv activations alone are fine (conv native bf16-out −0.0012), so the approximation is the cause |
+| A8 → D2 | EXAMPLE | Conv-stack swish | `silu` | `ConvStack` activations | **done 10-23, fails end to end**: `kernels/silu`, op `swish`. Phase 1 PASS at the example's tol (atol 0.05), but the tanh-based SiLU flushes x < −6 to 0 and is biased up to ~10% on [−5, −2]; 50 reads: 11/50 reads align. bf16 conv activations alone are fine (conv native bf16-out −0.0012), so the approximation is the cause |
 | A9 | EXAMPLE + MOD | hac/fast CRF tail: CRF linear (GEMM) + tanh. **Mod:** no tanh example; build tanh = 2·sigmoid(2x) − 1 | GEMM + `sigmoid` | `CRFModel.cpp` LinearCRF | not started |
 | A10 | EXAMPLE | hac/fast conv stack through the existing im2col + GEMM path | GEMM (same as SUP conv) | `ConvStack` (fast/hac) | not started |
 | A11 | EXAMPLE | Softmax (only useful if attention stays split up) | `softmax` | SDPA internals | low value |
@@ -46,6 +46,19 @@ wqkv, out_proj, upsample, crf, rmsnorm, rope, conv (im2col + GEMM).
 | C6 | **HAND-CODED EXTRA** | Individual identity gates for RMSNorm and RoPE | both slotted in without gates; all-10 run fails identity | not started |
 | C7 | **HAND-CODED EXTRA** | Round-to-nearest bfp16ebs8 weight packer (the example's truncates) so `gemm_bfp16w` works for conv | A6 conv: no alignments; −1…−1.6% weight-sum shift | not started |
 | C8 | **HAND-CODED EXTRA** | Accurate bf16 SiLU for the conv stack (the example's tanh form flushes x < −6 to 0, ~10% bias on [−5, −2]) | A8: 11/50 reads align | not started |
+
+## D. Ported but not working combined (bottom of the list; revisit after the C fix)
+
+Moved here 10-23. Combined = with the 10-14 ops (fc1, fc2, silu_mul, wqkv, out_proj, upsample, crf, rmsnorm, rope, conv)
+and the other 10-23 ports (ledger R22).
+
+| # | Kind | Item | Combined result | Needs |
+|---|---|---|---|---|
+| D1 (was A6) | EXAMPLE | bfp16w GEMM (`bf16_x_bfp16`) | **partial**: works only with conv left on the iGPU, −0.0069 (76.6 s); with conv it breaks | C7 rounding packer |
+| D2 (was A8) | EXAMPLE | Conv-stack swish (`silu`) | **broken**: both runs with it fail (7 and 12 of 50 reads align) | C8 accurate SiLU |
+
+Working combined (the 12-op run, all GEMMs native f32-out: −0.0018, 120.8 s): A2 fused norm2 + QKV + RoPE, A5 f32-out
+GEMM (native build), A7 axpy residual.
 
 ## 10-23 combined result (ledger R22)
 

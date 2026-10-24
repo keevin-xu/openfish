@@ -151,3 +151,8 @@ New kernels: `kernels/gemm_f32out` (bf16_in_fp32_out), `kernels/axpy`, `kernels/
 GEMMs −0.0012; bfp16w GEMMs −0.0012 except conv (no alignments: truncating packer); swish fails (11/50 align: the
 example's tanh SiLU is biased). Combined, 12 ops (all but swish), native f32-out GEMMs: −0.0018, 120.8 s vs 10.6 s.
 Ledger R21/R22 in `npu-adapting/9-16-npu-adapting-session/results-ledger.md`.
+
+### 2026-10-23 — target list: A6 and A8 moved to the bottom
+Ports that work combined with the 10-14 ops (R22 12-op run, native f32-out GEMMs, −0.0018): A2, A5 (native), A7.
+A6 (partial: only without conv, −0.0069) and A8 (breaks every combined run) moved to new section D at the bottom of
+`npu/docs/porting_targets.md`, gated on C7 / C8.
