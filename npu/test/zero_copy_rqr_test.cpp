@@ -240,16 +240,16 @@ int main(int argc, char **argv) {
     for (void *p : dps) (void)hipFree(p);
 
     // ---- part 4: which combinations of imported args work (fresh run each)
-    printf("\npart 4: subsets of imported args (fresh run each; others host BOs)\n| imported | normed | v | q_roped | k_roped |\n|---|---|---|---|---|\n");
-    const std::vector<std::vector<int>> subsets = {{2, 8}, {2, 11}, {2, 12}, {8, 11}, {8, 12}, {11, 12}, {0, 2}, {0, 12},
-                                                   {2, 8, 11}, {2, 8, 12}, {8, 11, 12}, {2, 11, 12}, {2, 8, 11, 12}};
+    printf("\npart 4: subsets of imported args (fresh run each; others host BOs)\n| alloc | imported | normed | v | q_roped | k_roped |\n|---|---|---|---|---|---|\n");
+    const std::vector<std::vector<int>> subsets = {{2, 8}, {0, 2}, {2, 8, 11, 12}, {0, 2, 8, 11, 12}};
+    for (uint64_t alloc : {act, act * 2, 2ull << 20, 4ull << 20, 64ull << 20})
     for (const auto &sub : subsets) {
         std::vector<xrt::bo> a = host;
         std::vector<std::pair<int, void *>> imp;
         for (int i : sub) {
-            void *dp = hip_alloc(act, false);
+            void *dp = hip_alloc(alloc, false);
             imp.emplace_back(i, dp);
-            a[i] = import_bo(dev, dp, act);
+            a[i] = import_bo(dev, dp, alloc);
             if (i == 0) {
                 HIP_OK(hipMemcpy(dp, host[0].map<uint16_t *>(), act, hipMemcpyHostToDevice));
             } else {
@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
             for (uint64_t j = 0; j < act / 2; ++j) bad += got[j] != ref[i][j];
             res += std::string(" | ") + (bad ? "WRONG" : "ok") + (dp ? "*" : "");
         }
-        printf("| %s%s |\n", label.c_str(), res.c_str());
+        printf("| %lu KiB | %s%s |\n", (unsigned long)(alloc >> 10), label.c_str(), res.c_str());
         for (auto &pr : imp) (void)hipFree(pr.second);
     }
     printf("(* = that output is an imported iGPU buffer)\n");
