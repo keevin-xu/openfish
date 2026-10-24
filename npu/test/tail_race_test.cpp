@@ -7,6 +7,8 @@
 // If any remain, poll only that range until they are gone:
 //   mode sync    bo.sync(FROM_DEVICE) on the range before each scan (what a retry in nn_npu.cpp would do)
 //   mode nosync  re-read the map without syncing (data appearing anyway = late DMA write, not a stale CPU cache)
+// Each mode runs with the output region cold (flushed by the sync after the sentinel fill) and warm (the CPU then
+// reads the whole output before the launch, as nn_npu.cpp's memcpy of the previous launch's result leaves it).
 // Inputs: every other argument is filled once with bf16 values in [-1, 1).
 //
 //   g++ -O2 -std=c++17 tail_race_test.cpp -lxrt_coreutil -o tail_race_test
@@ -102,12 +104,20 @@ int main(int argc, char **argv) {
            launches);
 
     bool clean = true;
-    for (int mode = 0; mode < 2; ++mode) {
+    volatile uint64_t sink = 0;
+    for (int m4 = 0; m4 < 4; ++m4) {
+        const int mode = m4 & 1;
+        const bool warm = m4 >> 1;
         int hits = 0, never = 0;
         std::vector<double> elems, from_end, clear_us, polls, kern_us;
         for (int l = 0; l < launches + 1; ++l) {
             std::memset(op, 0xFF, out_bytes);
             out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            if (warm) {
+                uint64_t acc = 0;
+                for (uint64_t b = 0; b < out_bytes; b += 64) acc += op[b];
+                sink = sink + acc;
+            }
             auto tk = clock_type::now();
             run.start();
             if (run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
@@ -139,7 +149,8 @@ int main(int argc, char **argv) {
             polls.push_back(p);
         }
         clean &= hits == 0;
-        printf("  mode %-6s: %d/%d launches had unwritten output after wait + sync", mode ? "nosync" : "sync", hits, launches);
+        printf("  %s cache, poll %-6s: %d/%d launches had unwritten output after wait + sync", warm ? "warm" : "cold",
+               mode ? "nosync" : "sync", hits, launches);
         if (hits) {
             printf("; elements median %.0f max %.0f; first unwritten element median %.0f / max %.0f from the end; "
                    "visible after median %.1f us / max %.1f us (%.0f / %.0f polls)%s",
