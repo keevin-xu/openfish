@@ -10,6 +10,11 @@
 // Each mode runs with the output region cold (flushed by the sync after the sentinel fill) and warm (the CPU then
 // reads the whole output before the launch, as nn_npu.cpp's memcpy of the previous launch's result leaves it).
 // Inputs: every other argument is filled once with bf16 values in [-1, 1).
+// Then mode "alt" follows nn_npu.cpp exactly: fresh inputs copied into the BO maps and synced before every launch,
+// the output BO never written by the CPU, read back with sync(FROM_DEVICE) + memcpy. Inputs alternate between two
+// sets A and B; each read is compared with that set's settled output (launched alone, then 50 ms before the sync),
+// so any difference is a value the CPU saw before the NPU's write ("stale" when it equals the other set's output).
+// TAIL_RACE_SENTINEL=0 skips the sentinel modes.
 //
 //   g++ -O2 -std=c++17 tail_race_test.cpp -lxrt_coreutil -o tail_race_test
 //   flock -x -w 600 $HOME/.npu.lock tail_race_test <elf> <kernel_name> <launches> <out_arg> <out_elem_bytes> \
@@ -23,12 +28,15 @@
 #include <xrt/experimental/xrt_elf.h>
 #include <xrt/experimental/xrt_ext.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -105,7 +113,9 @@ int main(int argc, char **argv) {
 
     bool clean = true;
     volatile uint64_t sink = 0;
-    for (int m4 = 0; m4 < 4; ++m4) {
+    const char *sen = std::getenv("TAIL_RACE_SENTINEL");
+    const int sentinel_modes = sen && std::string(sen) == "0" ? 0 : 4;
+    for (int m4 = 0; m4 < sentinel_modes; ++m4) {
         const int mode = m4 & 1;
         const bool warm = m4 >> 1;
         int hits = 0, never = 0;
@@ -159,6 +169,95 @@ int main(int argc, char **argv) {
             if (never) printf("; %d never became visible within 100 ms", never);
         }
         printf("; kernel (start..wait) median %.0f us\n", pct(kern_us, 0.5));
+    }
+    // ---- mode alt (the nn_npu.cpp pattern)
+    std::vector<std::vector<std::vector<uint16_t>>> sets(2, std::vector<std::vector<uint16_t>>(sizes.size()));
+    for (int st = 0; st < 2; ++st) {
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if ((int)i == out_arg) continue;
+            auto &v = sets[st][i];
+            v.resize(sizes[i] / 2);
+            uint32_t h = 777u + 1000u * (uint32_t)st + (uint32_t)i;
+            for (auto &e : v) {
+                h = h * 1664525u + 1013904223u;
+                float f = ((int)(h >> 8 & 0xffff) - 32768) / 32768.0f;
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                e = (uint16_t)(u >> 16);
+            }
+        }
+    }
+    auto load = [&](int st) {
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if ((int)i == out_arg) continue;
+            std::memcpy(bos[i].map<uint8_t *>(), sets[st][i].data(), sizes[i]);
+            bos[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+    };
+    auto launch = [&] {
+        run.start();
+        if (run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) throw std::runtime_error("timeout");
+    };
+    std::vector<uint8_t> ref[2], again;
+    for (int st = 0; st < 2; ++st) {
+        load(st);
+        launch();
+        usleep(50000);
+        out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        ref[st].assign(op, op + out_bytes);
+    }
+    load(0);
+    launch();
+    usleep(50000);
+    out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    again.assign(op, op + out_bytes);
+    const bool deterministic = again == ref[0];
+    printf("  alt: settled outputs A and B differ: %s; kernel deterministic (A twice): %s\n", ref[0] != ref[1] ? "yes" : "NO",
+           deterministic ? "yes" : "NO");
+    std::vector<uint8_t> host(out_bytes);
+    for (int poll_sync = 1; poll_sync >= 0; --poll_sync) {
+        int hits = 0, never = 0;
+        std::vector<double> elems, stale_frac, from_end, clear_us;
+        for (int l = 0; l < 2 * launches; ++l) {
+            const int st = l & 1;
+            load(st);
+            launch();
+            auto t0 = clock_type::now();
+            out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            std::memcpy(host.data(), op, out_bytes);
+            if (std::memcmp(host.data(), ref[st].data(), out_bytes) == 0) continue;
+            uint64_t bad = 0, stale = 0, lo = n, hi = 0;
+            for (uint64_t e = 0; e < n; ++e) {
+                const uint8_t *h = host.data() + e * eb;
+                if (std::memcmp(h, ref[st].data() + e * eb, eb) == 0) continue;
+                ++bad;
+                stale += std::memcmp(h, ref[1 - st].data() + e * eb, eb) == 0;
+                lo = std::min(lo, e);
+                hi = std::max(hi, e);
+            }
+            ++hits;
+            elems.push_back((double)bad);
+            stale_frac.push_back((double)stale / bad);
+            from_end.push_back((double)(n - lo));
+            bool ok = false;
+            while (!ok && us_since(t0) < 100000) {
+                if (poll_sync) out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                ok = std::memcmp(op + lo * eb, ref[st].data() + lo * eb, (hi - lo + 1) * eb) == 0;
+            }
+            if (!ok) ++never;
+            clear_us.push_back(us_since(t0));
+        }
+        clean &= hits == 0;
+        printf("  alt (nn_npu pattern), poll %-6s: %d/%d launches read wrong output", poll_sync ? "sync" : "nosync", hits,
+               2 * launches);
+        if (hits) {
+            printf("; elements median %.0f max %.0f (%.0f%% of them the previous launch's value); first wrong element "
+                   "median %.0f / max %.0f from the end; correct after median %.1f us / max %.1f us",
+                   pct(elems, 0.5), pct(elems, 1), 100 * pct(stale_frac, 0.5), pct(from_end, 0.5), pct(from_end, 1),
+                   pct(clear_us, 0.5), pct(clear_us, 1));
+            if (never) printf("; %d not correct within 100 ms", never);
+        }
+        printf("\n");
     }
     printf("RESULT: %s\n", clean ? "CLEAN" : "RACE");
     return clean ? 0 : 1;
