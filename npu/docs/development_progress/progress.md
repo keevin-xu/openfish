@@ -175,3 +175,8 @@ guard-off and the 10-23 run are bit-identical (50/50 reads, median 0.976351, −
 BO per (kernel, role) and runs device-pointer variants of the GEMM and silu_mul (`OPENFISH_NPU_ZEROCOPY`); the slorado
 hooks keep tensors on the iGPU with the same casts. 50 reads: group 69.9 → 50.7 s, peak RAM 4.05 → 1.99 GB, bit-identical;
 comb12 119.4 → 105.4 s, bit-identical. Ledger R26 / D31.
+
+### 2026-10-24 — zero-copy step 2 stopped
+Zero-copy rms_qkv_rope does not work (the iGPU never sees the NPU's writes to the imported output buffers; wrong
+basecalls with the guard off). Residual (axpy) and FFN zero-copy are bit-identical on 3 reads; shared buffers are now
+allocated uncached on the iGPU by default. conv / rmsnorm / rope zero-copy implemented, not yet run. debug_log 2026-10-24.

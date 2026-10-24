@@ -61,3 +61,6 @@
 - 2026-10-24 (follow-up): the stale-output race reproduced in standalone tests did not occur in slorado's own launch
   pattern (two guarded comb12 runs: 0 waits in 14,752 launches; unguarded run bit-identical). Test the real pipeline
   before assuming a microbenchmark failure mode applies to it; keep cheap guards with counters so it stays observable.
+- 2026-10-24: a zero-copy path can fail per kernel even when the mechanism is proven on others (GEMM, silu_mul, axpy fine;
+  the 13-arg multi-launch rms_qkv_rope ELF's outputs never reach the iGPU). Gate every kernel separately, and keep the
+  stale-output guard on: it turned a silent wrong-output bug into an obvious stall.

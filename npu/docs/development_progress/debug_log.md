@@ -29,3 +29,10 @@
 ### 2026-10-24 (cont.) — guard implemented; race absent in slorado
 - `src/nn_npu.cpp`: guard_arm()/guard_wait() around every launch (tail 4 KiB marker + re-sync, per-op counters, OPENFISH_NPU_GUARD=0 off).
 - comb12 (50 reads, 12 ops, native f32-out GEMMs), binary 8822a258: guard on ×2 → 0 waits in 14,752 launches each; guard off; all three bit-identical to each other and to the 10-23 run (653d6379). The race reproduced by the standalone tests did not occur in slorado here. Open: why the standalone pattern triggers it (fresh 8 MiB input memcpy + sync right before each launch, HIP active) and slorado's does not.
+
+### 2026-10-24 — zero-copy rms_qkv_rope: NPU outputs never visible to the iGPU
+- Setup: shared buffers = iGPU allocation exported as dma-buf, imported with `xrt::bo(device, pid, fd)`, bound as args 0 (x) and 2/8/11/12 (normed, v, q_roped, k_roped) of the 13-arg `rms_gemms_rope` ELF; args 4/6 (q, k intermediates) stay host BOs; LUTs and weights host BOs.
+- Symptom: the guard's 0xFF marker stays in all four outputs for the full 50 ms on every launch (run crawls); with OPENFISH_NPU_GUARD=0 the run completes but basecalls are wrong (3 reads: 0/3 exact).
+- Not the cause: the strided q|k|v copies (replaced by contiguous copies, same result); iGPU caching (uncached allocation, same result).
+- Same mechanism works for the GEMM ELFs (bit-identical over 2,304+ launches per run), silu_mul and axpy (bit-identical).
+- Next: standalone repro with this ELF (zero_copy_test-style: import one output at a time to find which arg breaks; try a larger/aligned buffer; check XRT logs for the patching of imported BOs).
