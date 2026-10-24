@@ -138,7 +138,69 @@ struct npu_stats_t {
     double t_in = 0;      // layout split + f32->bf16 + sync to device
     double t_kernel = 0;  // run.start() .. wait2()
     double t_out = 0;     // sync from device + bf16->f32
+    uint64_t guard_retried = 0, guard_polls = 0, guard_timeouts = 0;  // stale-output guard (below)
+    double guard_wait = 0;
 };
+
+// Stale-output guard (development_progress/debug_log.md 2026-10-24): after run.wait() + bo.sync(FROM_DEVICE), the
+// last few hundred elements of an output BO can still read as the previous launch's values for up to ~1 ms (rare
+// with XRT alone, frequent with HIP active in the process). Before a launch, guard_arm() fills the output's last
+// kGuardBytes with 0xFF (NaN in bf16 and f32) and syncs that range; after the launch and sync, guard_wait() re-syncs
+// that range until no all-0xFF element is left. The CPU's last write there is the marker, so any other value read is
+// the NPU's new data. OPENFISH_NPU_GUARD=0 turns it off.
+constexpr uint64_t kGuardBytes = 4096;
+constexpr double kGuardTimeout = 0.05;  // s; a kernel that really outputs all-0xFF NaNs there would otherwise spin
+
+bool guard_on() {
+    static const bool on = [] {
+        const char *e = std::getenv("OPENFISH_NPU_GUARD");
+        const bool v = !(e && std::string(e) == "0");
+        fprintf(stderr, "[nn_npu] stale-output guard %s\n", v ? "on" : "off (OPENFISH_NPU_GUARD=0)");
+        return v;
+    }();
+    return on;
+}
+
+void guard_arm(xrt::bo &bo, void *map, uint64_t bytes) {
+    if (!guard_on()) return;
+    const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
+    std::memset(static_cast<uint8_t *>(map) + off, 0xFF, g);
+    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE, g, off);
+}
+
+bool guard_marked(const void *p, uint64_t g, uint64_t elem_bytes) {
+    if (elem_bytes == 4) {
+        const uint32_t *q = static_cast<const uint32_t *>(p);
+        for (uint64_t i = 0; i < g / 4; ++i) {
+            if (q[i] == 0xFFFFFFFFu) return true;
+        }
+        return false;
+    }
+    const uint16_t *q = static_cast<const uint16_t *>(p);
+    for (uint64_t i = 0; i < g / 2; ++i) {
+        if (q[i] == 0xFFFFu) return true;
+    }
+    return false;
+}
+
+// Call after the output BO's bo.sync(FROM_DEVICE), before reading it.
+void guard_wait(xrt::bo &bo, const void *map, uint64_t bytes, uint64_t elem_bytes, npu_stats_t &stats) {
+    if (!guard_on()) return;
+    const uint64_t g = std::min(bytes, kGuardBytes), off = bytes - g;
+    const uint8_t *tail = static_cast<const uint8_t *>(map) + off;
+    if (!guard_marked(tail, g, elem_bytes)) return;
+    auto t0 = clock_type::now();
+    stats.guard_retried += 1;
+    while (guard_marked(tail, g, elem_bytes)) {
+        if (seconds_since(t0) > kGuardTimeout) {
+            stats.guard_timeouts += 1;
+            break;
+        }
+        bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE, g, off);
+        stats.guard_polls += 1;
+    }
+    stats.guard_wait += seconds_since(t0);
+}
 
 // One compiled 3-tensor elementwise kernel (in0, in1, out), resident for the process lifetime.
 struct elementwise_kernel_t {
@@ -252,9 +314,11 @@ void print_stats() {
             continue;
         }
         fprintf(stderr,
-                "[nn_npu] %s: %lu calls, %lu launches, %lu elements; host in %.3f s, kernel %.3f s (%.1f ms/launch), host out %.3f s\n",
+                "[nn_npu] %s: %lu calls, %lu launches, %lu elements; host in %.3f s, kernel %.3f s (%.1f ms/launch), host out %.3f s; "
+                "stale-output guard: %lu launches waited (%lu re-syncs, %.4f s, %lu timeouts)\n",
                 it.first.c_str(), (unsigned long)s.calls, (unsigned long)s.launches, (unsigned long)s.elements, s.t_in,
-                s.t_kernel, 1e3 * s.t_kernel / std::max<uint64_t>(s.launches, 1), s.t_out);
+                s.t_kernel, 1e3 * s.t_kernel / std::max<uint64_t>(s.launches, 1), s.t_out, (unsigned long)s.guard_retried,
+                (unsigned long)s.guard_polls, s.guard_wait, (unsigned long)s.guard_timeouts);
     }
 }
 
@@ -390,6 +454,7 @@ static void silu_mul_impl(const In *x, Out *o, uint64_t MN, uint64_t K) {
             }
             k.bo_in0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             k.bo_in1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            guard_arm(k.bo_out, k.out, n * sizeof(uint16_t));
             auto t1 = clock_type::now();
 
             k.run.start();
@@ -399,6 +464,7 @@ static void silu_mul_impl(const In *x, Out *o, uint64_t MN, uint64_t K) {
             auto t2 = clock_type::now();
 
             k.bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            guard_wait(k.bo_out, k.out, n * sizeof(uint16_t), 2, k.stats);
             parallel_for(count, g_threads, [&](uint64_t a, uint64_t b) {
                 for (uint64_t i = a; i < b; ++i) {
                     store_bf16(o[begin + i], k.out[i]);
@@ -511,6 +577,12 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
                 std::memset(g.a + count * K, 0, (m - count) * K * sizeof(uint16_t));
             }
             g.bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            // guard the output this call reads (the fp32 accumulator, or the bf16 result)
+            if constexpr (std::is_same<Out, float>::value) {
+                if (g.c32) guard_arm(g.bo_c32, g.c32, m * N * sizeof(float));
+            } else {
+                if (g.c16) guard_arm(g.bo_c16, g.c16, m * N * sizeof(uint16_t));
+            }
             auto t2 = clock_type::now();
 
             g.run.start();
@@ -525,6 +597,7 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
                                              "(bf16 output only; unset OPENFISH_NPU_GEMM_OUT)");
                 }
                 g.bo_c32.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // fp32 accumulator
+                guard_wait(g.bo_c32, g.c32, m * N * sizeof(float), 4, stats);
                 parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
                     std::memcpy(out + begin * N + lo, g.c32 + lo, (hi - lo) * sizeof(float));
                 });
@@ -534,6 +607,7 @@ static void linear_impl(const char *op, const In *x, Out *out, const float *weig
                                              "(set OPENFISH_NPU_GEMM_OUT=f32)");
                 }
                 g.bo_c16.sync(XCL_BO_SYNC_BO_FROM_DEVICE);  // bf16 output of the cast launch
+                guard_wait(g.bo_c16, g.c16, m * N * sizeof(uint16_t), 2, stats);
                 parallel_for(count * N, g_threads, [&](uint64_t lo, uint64_t hi) {
                     std::memcpy(out + begin * N + lo, g.c16 + lo, (hi - lo) * sizeof(uint16_t));
                 });
@@ -644,6 +718,7 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t ro
         });
         if (count < k.m) std::memset(k.pa + count * k.n, 0, (k.m - count) * k.n * sizeof(uint16_t));
         k.bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        guard_arm(k.bo_c, k.pc, k.m * k.n * sizeof(uint16_t));
         auto t2 = clock_type::now();
         k.run.start();
         if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
@@ -651,6 +726,7 @@ void run_rows(kernel3_t &k, npu_stats_t &stats, const In *x, Out *y, uint64_t ro
         }
         auto t3 = clock_type::now();
         k.bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        guard_wait(k.bo_c, k.pc, k.m * k.n * sizeof(uint16_t), 2, stats);
         parallel_for(count * k.n, g_threads, [&](uint64_t lo, uint64_t hi) {
             for (uint64_t i = lo; i < hi; ++i) store_bf16(y[begin * k.n + i], k.pc[i]);
         });
@@ -768,6 +844,7 @@ void run_eltwise(eltwise_kernel_t &k, npu_stats_t &stats, const uint16_t *a, con
             if (count < k.n) std::memset(k.in[i] + count, 0, (k.n - count) * sizeof(uint16_t));
             k.bo_in[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
+        guard_arm(k.bo_out, k.out, k.n * sizeof(uint16_t));
         auto t1 = clock_type::now();
         k.run.start();
         if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
@@ -775,6 +852,7 @@ void run_eltwise(eltwise_kernel_t &k, npu_stats_t &stats, const uint16_t *a, con
         }
         auto t2 = clock_type::now();
         k.bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        guard_wait(k.bo_out, k.out, k.n * sizeof(uint16_t), 2, stats);
         parallel_for(count, g_threads, [&](uint64_t lo, uint64_t hi) {
             std::memcpy(o + begin + lo, k.out + lo, (hi - lo) * sizeof(uint16_t));
         });
@@ -935,13 +1013,17 @@ void rms_qkv_rope_npu_bf16(const uint16_t *x, const float *norm_w, const float *
                 std::memcpy(k.p[0] + lo, x + begin * d + lo, (hi - lo) * sizeof(uint16_t));
             });
             k.bo[0].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            for (int i : {2, 11, 12, 8}) guard_arm(k.bo[i], k.p[i], m * d * sizeof(uint16_t));
             auto t2 = clock_type::now();
             k.run.start();
             if (k.run.wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) {
                 throw std::runtime_error("rms_qkv_rope launch timed out after 60 s");
             }
             auto t3 = clock_type::now();
-            for (int i : {2, 11, 12, 8}) k.bo[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            for (int i : {2, 11, 12, 8}) {
+                k.bo[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                guard_wait(k.bo[i], k.p[i], m * d * sizeof(uint16_t), 2, stats);
+            }
             parallel_for(m, g_threads, [&](uint64_t lo, uint64_t hi) {
                 for (uint64_t r = lo; r < hi; ++r) {
                     const uint64_t row = begin + r;
