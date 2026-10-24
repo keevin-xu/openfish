@@ -8,6 +8,8 @@
 // Part 2: the rms_qkv_rope ELF with random inputs; reference = all host XRT BOs. Then one arg at a time (x, normed,
 //         v, q_roped, k_roped) replaced by an iGPU buffer imported into XRT, at the exact size and padded to 64 MiB;
 //         outputs read back through the iGPU and compared bit-for-bit with the reference.
+// Part 3: all five on imported buffers at once, (a) on a fresh xrt::run and (b) re-bound with set_arg on a run that was
+//         already launched with host BOs (what nn_npu.cpp does); and (c) host BOs re-bound on a used run.
 //
 //   hipcc -x hip --offload-arch=gfx1151 -O2 -std=c++17 zero_copy_rqr_test.cpp -lxrt_coreutil -o zero_copy_rqr_test
 //   LD_LIBRARY_PATH=/opt/rocm/lib flock -x -w 600 $HOME/.npu.lock zero_copy_rqr_test <artifacts dir>
@@ -175,5 +177,66 @@ int main(int argc, char **argv) {
                    res.c_str(), note.c_str());
         }
     }
+
+    // ---- part 3: all five imported at once; fresh run vs set_arg re-binding on a used run
+    printf("\npart 3: args 0, 2, 8, 11, 12 together\n| case | outputs correct (normed, v, q_roped, k_roped) |\n|---|---|\n");
+    std::vector<void *> dps;
+    std::vector<xrt::bo> args = host;
+    for (int i : {0, 2, 8, 11, 12}) {
+        void *dp = hip_alloc(act, false);
+        dps.push_back(dp);
+        args[i] = import_bo(dev, dp, act);
+    }
+    auto check = [&](const char *what, std::vector<xrt::bo> &a, bool imported, xrt::run *reuse) {
+        // inputs and markers
+        if (imported) {
+            HIP_OK(hipMemcpy(dps[0], host[0].map<uint16_t *>(), act, hipMemcpyHostToDevice));
+            for (int k = 1; k < 5; ++k) HIP_OK(hipMemset(dps[k], 0xFF, act));
+            HIP_OK(hipDeviceSynchronize());
+        } else {
+            for (int i : {2, 8, 11, 12}) {
+                std::memset(host[i].map<uint8_t *>(), 0xFF, act);
+                host[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+        }
+        for (int i : {0, 2, 8, 11, 12}) a[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (reuse) {
+            for (int i = 0; i < 13; ++i) reuse->set_arg(i, a[i]);
+            reuse->start();
+            if (reuse->wait2(std::chrono::milliseconds(60000)) == std::cv_status::timeout) throw std::runtime_error("timeout");
+        } else {
+            launch(a);
+        }
+        std::string res;
+        int k = 1;
+        for (int i : {2, 8, 11, 12}) {
+            std::vector<uint16_t> got(act / 2);
+            a[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            if (imported) {
+                HIP_OK(hipMemcpy(got.data(), dps[k++], act, hipMemcpyDeviceToHost));
+            } else {
+                std::memcpy(got.data(), host[i].map<uint16_t *>(), act);
+            }
+            uint64_t bad = 0, marker = 0;
+            for (uint64_t j = 0; j < act / 2; ++j) {
+                bad += got[j] != ref[i][j];
+                marker += got[j] == 0xFFFF;
+            }
+            res += std::string(bad ? "WRONG" : "ok") + (bad ? "(" + std::to_string(bad) + ", marker " + std::to_string(marker) + ")" : "") + " ";
+        }
+        printf("| %s | %s |\n", what, res.c_str());
+    };
+    check("(a) fresh run, all imported", args, true, nullptr);
+    xrt::run used(kernel);
+    for (int i = 0; i < 13; ++i) used.set_arg(i, host[i]);
+    used.start();
+    used.wait2(std::chrono::milliseconds(60000));
+    check("(b) used run, set_arg to imported", args, true, &used);
+    check("(c) same run, set_arg back to host", host, false, &used);
+    check("(d) same run, set_arg to imported again", args, true, &used);
+    xrt::run fresh_imported(kernel);
+    for (int i = 0; i < 13; ++i) fresh_imported.set_arg(i, args[i]);
+    check("(e) run created with imported, re-launched", args, true, &fresh_imported);
+    for (void *p : dps) (void)hipFree(p);
     return 0;
 }
